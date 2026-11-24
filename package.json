@@ -1,0 +1,12 @@
+{
+  "name": "isp-billing-prototype",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:billing": "node --test simulation/billing.test.mjs",
+    "demo:billing": "node simulation/demo.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,32 @@
+import { MemoryStore } from './store.mjs';
+import { FakePayments, FakeRouter } from './adapters.mjs';
+import { BillingSimulation } from './billing.mjs';
+
+let now = Date.parse('2026-10-14T09:00:00Z');
+const store = new MemoryStore();
+const payments = new FakePayments();
+const router = new FakeRouter();
+const billing = new BillingSimulation({ store, payments, router, clock: () => now });
+const order = await billing.checkout({ customerId: 'demo-customer', target: 'demo-router/demo-hotspot',
+  packageTerms: { name: 'One hour', amountMinor: 1000, currency: 'KES', durationMs: 3600000, deviceLimit: 1 } });
+const attempt = await billing.requestPayment(order.id);
+console.log('1. KES 10 order created; simulated STK request pending.');
+console.log('2. Callback before settlement:', (await billing.paymentNotification(attempt.id)).outcome);
+payments.settle(attempt.id);
+const { operationKey } = await billing.paymentNotification(attempt.id);
+console.log('3. Verified simulated payment; access awaits activation.');
+router.mode = 'before_apply';
+console.log('4. Router outage:', (await billing.provision(operationKey)).outcome);
+now += 30 * 60_000;
+router.mode = 'after_apply';
+console.log('5. Router applies access but reply is lost:', (await billing.provision(operationKey)).outcome);
+now += 5 * 60_000;
+router.mode = 'ready';
+const ready = await billing.provision(operationKey);
+console.log('6. Reconciled activation:', new Date(ready.activationAt).toISOString());
+console.log('   Original expiry preserved:', new Date(ready.expiresAt).toISOString());
+console.log('7. Replayed callback:', (await billing.paymentNotification(attempt.id)).outcome);
+now = ready.expiresAt;
+console.log('8. At expiry, simulated router allows access:', router.hasAccess(order.target, now));
+console.log('9. Expiry reconciliation:', (await billing.expire(operationKey, 1)).outcome);
+console.log(`Router grants applied: ${router.applyCount}. Real charges or router calls: 0.`);

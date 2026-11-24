@@ -1,0 +1,22 @@
+rest billing_db_rest {
+    authorize {
+        uri = "http://127.0.0.1:3009/authenticate"
+        method = 'post'
+        body = 'json'
+        timeout = 3.0
+        do_xlat = no
+    }
+    accounting {
+        uri = "http://127.0.0.1:3009/accounting"
+        method = 'post'
+        body = 'json'
+        timeout = 3.0
+        do_xlat = no
+    }
+    pool {
+        start = 0
+        min = 0
+        max = 8
+        spare = 1
+    }
+}

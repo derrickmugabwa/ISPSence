@@ -1,0 +1,35 @@
+.billing-overview-toolbar { display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap; }
+.billing-overview-toolbar select { width:auto; }
+.billing-overview-filters { display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px; }
+.billing-overview-filters label { font-size:11px;color:var(--ink-3); }
+.billing-overview-filters .input { margin-top:4px; }
+.billing-overview-cards { display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px; }
+.billing-overview-cards button { display:grid;grid-template-columns:1fr auto;gap:8px;text-align:left;padding:16px;cursor:pointer; }
+.billing-overview-cards button svg { grid-column:2;grid-row:1;color:var(--accent); }
+.billing-overview-cards button span { grid-column:1;grid-row:1;font-size:12px;color:var(--ink-2); }
+.billing-overview-cards strong { grid-column:1/-1;font-size:26px;font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums; }
+.billing-overview-cards small { grid-column:1/-1;font-size:11px;color:var(--ink-3); }
+.billing-overview-cards button:hover { border-color:var(--accent); }
+.billing-overview-secondary { display:grid;grid-template-columns:1fr 1fr;gap:12px; }
+.billing-attention-list button { display:flex;align-items:center;gap:12px;width:100%;padding:9px 0;font-size:12px;border-bottom:1px solid var(--line);text-align:left;color:var(--ink-2);cursor:pointer; }
+.billing-attention-list strong { margin-left:auto;font-family:var(--font-mono,monospace);color:var(--ink); }
+.billing-attention-list button:last-child { border:0; }
+.billing-access-counts { display:grid;grid-template-columns:1fr 1fr;gap:8px; }
+.billing-access-counts button { padding:10px 12px;border-radius:6px;background:var(--surface-2);text-align:left;display:flex;justify-content:space-between;font-size:12px;color:var(--ink-2);cursor:pointer; }
+.billing-overview-charts { display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px; }
+.billing-register-toolbar { display:flex;align-items:center;gap:8px;flex-wrap:wrap;scroll-margin-top:20px; }
+.billing-register-search { flex:1;min-width:220px;position:relative; }
+.billing-register-search svg { position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--ink-3); }
+.billing-register-search input { padding-left:32px; }
+.billing-register-toolbar > select { width:auto;max-width:220px; }
+.billing-register-table { width:100%;font-size:12px;text-align:left;white-space:normal; }
+.billing-register-table th { font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-3);padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap; }
+.billing-register-table td { padding:12px;border-bottom:1px solid var(--line);color:var(--ink-2);vertical-align:top; }
+.billing-register-table small { display:block;font-size:10px;color:var(--ink-3);margin-top:5px; }
+.billing-record-link { color:var(--ink);font-weight:500;cursor:pointer;text-align:left; }
+.billing-record-link:hover { color:var(--accent); }
+.billing-dashboard-note { display:flex;align-items:flex-start;gap:8px;padding:12px;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;font-size:12px;color:var(--ink-2); }
+.billing-overview button:focus-visible { outline:2px solid var(--accent);outline-offset:2px; }
+@media(min-width:1500px) { .billing-overview-cards { grid-template-columns:repeat(6,minmax(0,1fr)); } }
+@media(max-width:1000px) { .billing-overview-filters { grid-template-columns:repeat(3,minmax(0,1fr)); }.billing-overview-charts { grid-template-columns:1fr 1fr; }.billing-overview-charts>section:first-child { grid-column:1/-1; } }
+@media(max-width:640px) { .billing-overview-cards,.billing-overview-filters { grid-template-columns:repeat(2,minmax(0,1fr)); }.billing-overview-secondary,.billing-overview-charts { grid-template-columns:1fr; }.billing-overview-charts>section:first-child { grid-column:auto; }.billing-overview-cards strong { font-size:22px; }.billing-overview-cards button { padding:12px; }.billing-register-table { min-width:850px; }.billing-overview button { min-height:44px; }.billing-overview-toolbar { align-items:flex-start; } }

@@ -1,0 +1,43 @@
+# FreeRADIUS 3.2 syntax; fictional identities only, no billing HTTP bridge.
+server pppoe_test {
+    listen {
+        type = auth
+        ipaddr = 127.0.0.1
+        port = 18120
+    }
+    authorize {
+        if (&NAS-Identifier != "pppoe-fixture" || &Service-Type != Framed-User || &Framed-Protocol != PPP || &Called-Station-Id != "fixture-internet" || &Calling-Station-Id != "02:00:00:00:00:01") {
+            reject
+        }
+        if (&User-Name != "fixture-paid" && &User-Name != "fixture-complimentary") {
+            reject
+        }
+        update control {
+            &Cleartext-Password := "$ENV{PPPOE_FIXTURE_PASSWORD}"
+        }
+        update reply {
+            &Service-Type := Framed-User
+            &Framed-Protocol := PPP
+            &Framed-Pool := "fixture-pool"
+            &Mikrotik-Rate-Limit := "2M/5M"
+            &Session-Timeout := 60
+            &Acct-Interim-Interval := 60
+            &Class := "pppoe-fixture-correlation"
+        }
+        chap
+        pap
+    }
+    authenticate {
+        Auth-Type PAP {
+            pap
+        }
+        Auth-Type CHAP {
+            chap
+        }
+    }
+    post-auth {
+        Post-Auth-Type REJECT {
+            attr_filter.access_reject
+        }
+    }
+}

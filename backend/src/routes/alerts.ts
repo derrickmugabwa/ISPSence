@@ -1,0 +1,205 @@
+import { Router } from 'express';
+import { query } from '../config/database';
+import { requireAuth, requireWrite, fleetOnly } from '../middleware/auth';
+import { alertService } from '../services/AlertService';
+import { maskConfig, mergeConfig, sealConfig } from '../utils/alertChannelSecrets';
+
+const router = Router();
+
+// All alert routes require authentication
+router.use(requireAuth);
+// Alert rules, channels and history cover the whole fleet (P1-7).
+router.use(fleetOnly);
+
+// ── Default rules seed ─────────────────────────────────────────────────────
+
+const DEFAULT_RULES = [
+  { event_type: 'device_offline',    enabled: true,  threshold: null, cooldown_min: 5  },
+  { event_type: 'device_online',     enabled: true,  threshold: null, cooldown_min: 5  },
+  { event_type: 'log_error',         enabled: false, threshold: null, cooldown_min: 15 },
+  { event_type: 'log_warning',       enabled: false, threshold: null, cooldown_min: 30 },
+  { event_type: 'high_cpu',          enabled: false, threshold: 90,   cooldown_min: 30 },
+  { event_type: 'high_memory',       enabled: false, threshold: 90,   cooldown_min: 30 },
+  { event_type: 'cert_expiry',       enabled: false, threshold: 14,   cooldown_min: 1440 },
+  { event_type: 'device_discovered',        enabled: false, threshold: null, cooldown_min: 60   },
+  { event_type: 'firmware_update_available', enabled: true,  threshold: null, cooldown_min: 1440 },
+  { event_type: 'config_drift',      enabled: false, threshold: null, cooldown_min: 15   },
+  // Hardware health (#168). On by default: a failed PSU or fan is exactly what
+  // someone wants to hear about, and it only fires on a change.
+  { event_type: 'device_degraded',         enabled: true, threshold: null, cooldown_min: 60 },
+  { event_type: 'device_health_restored',  enabled: true, threshold: null, cooldown_min: 60 },
+  // A changed certificate or host key could be someone posing as the device
+  // (outside review P1-4). On by default; it fires once per change.
+  { event_type: 'device_identity_changed', enabled: true, threshold: null, cooldown_min: 60 },
+  // A serious RouterOS CVE affecting a version the fleet runs (#224). Off by
+  // default; checked after the daily CVE feed refresh, once per CVE and version.
+  { event_type: 'cve_active', enabled: false, threshold: null, cooldown_min: 1440 },
+  // A WireGuard peer whose last handshake is older than the threshold, in
+  // minutes (#208). Off by default; one alert per peer, per cooldown.
+  { event_type: 'wireguard_stale', enabled: false, threshold: 15, cooldown_min: 60 },
+  // Bad frames on a port whose link is still up (#249): the threshold is
+  // errors a minute, averaged over 5 minutes. Off by default; per port.
+  { event_type: 'interface_errors', enabled: false, threshold: 10, cooldown_min: 60 },
+  // A port whose link went down this many times in an hour (#249). Off by
+  // default; per port.
+  { event_type: 'interface_flapping', enabled: false, threshold: 3, cooldown_min: 60 },
+  // An optic's light this many dB below its usual level (the past week's
+  // median), or the module at 70 °C or more. Off by default; per port.
+  { event_type: 'optic_degraded', enabled: false, threshold: 3, cooldown_min: 360 },
+];
+
+/**
+ * Insert any default rule that is missing; never changes an existing one.
+ * Also run at startup: rules added in an upgrade (device_degraded) otherwise
+ * did not exist, and so never fired, until someone opened the Alerting page.
+ */
+export async function ensureDefaultRules(): Promise<void> {
+  for (const rule of DEFAULT_RULES) {
+    await query(
+      `INSERT INTO alert_rules (event_type, enabled, threshold, cooldown_min)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (event_type) DO NOTHING`,
+      [rule.event_type, rule.enabled, rule.threshold, rule.cooldown_min]
+    );
+  }
+}
+
+// ── Alert Rules ────────────────────────────────────────────────────────────
+
+/** GET /api/alerts/rules — list all rules (seeds defaults on first call) */
+router.get('/rules', async (_req, res) => {
+  await ensureDefaultRules();
+  const rules = await query(
+    `SELECT event_type, enabled, threshold, cooldown_min, updated_at
+     FROM alert_rules ORDER BY event_type`
+  );
+  res.json(rules);
+});
+
+/** PUT /api/alerts/rules/:type — update a single rule */
+router.put('/rules/:type', requireWrite, async (req, res) => {
+  const { type } = req.params;
+  const { enabled, threshold, cooldown_min } = req.body;
+
+  const row = await alertService.upsertRule(type, {
+    enabled:     enabled     !== undefined ? Boolean(enabled)         : undefined,
+    threshold:   threshold   !== undefined ? (Number(threshold) || null) : undefined,
+    cooldown_min: cooldown_min !== undefined ? Number(cooldown_min)    : undefined,
+  });
+  // Turning CVE alerts on checks straight away instead of at the next daily
+  // feed refresh (#224).
+  if (type === 'cve_active' && row?.enabled) {
+    void import('../services/cveAlerts').then(({ checkCveAlerts }) => checkCveAlerts()).catch(() => {});
+  }
+  res.json(row);
+});
+
+// ── Alert Channels ─────────────────────────────────────────────────────────
+
+/** GET /api/alerts/channels */
+router.get('/channels', async (_req, res) => {
+  const channels = await query(
+    `SELECT id, name, type, enabled, config, created_at, updated_at
+     FROM alert_channels ORDER BY id`
+  );
+  // Mask sensitive fields before returning
+  const masked = channels.map((ch: Record<string, unknown>) => ({
+    ...ch,
+    config: maskConfig(ch.type as string, ch.config as Record<string, unknown>),
+  }));
+  res.json(masked);
+});
+
+/** POST /api/alerts/channels */
+router.post('/channels', requireWrite, async (req, res) => {
+  const { name, type, enabled = true, config = {} } = req.body;
+  if (!name || !type) {
+    return res.status(400).json({ error: 'name and type are required' });
+  }
+  const validTypes = ['email', 'slack', 'discord', 'telegram', 'ntfy', 'gotify'];
+  if (!validTypes.includes(type)) {
+    return res.status(400).json({ error: `type must be one of: ${validTypes.join(', ')}` });
+  }
+
+  const rows = await query(
+    `INSERT INTO alert_channels (name, type, enabled, config)
+     VALUES ($1, $2, $3, $4) RETURNING *`,
+    // Secrets are stored encrypted (outside review S7).
+    [name, type, Boolean(enabled), JSON.stringify(sealConfig(type, config))]
+  );
+  const ch = rows[0] as Record<string, unknown>;
+  res.status(201).json({
+    ...ch,
+    config: maskConfig(type, config),
+  });
+});
+
+/** PUT /api/alerts/channels/:id */
+router.put('/channels/:id', requireWrite, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const { name, enabled, config } = req.body;
+
+  // Fetch existing so we can merge config (preserve masked/unchanged fields)
+  const existing = await query<{ config: Record<string, unknown>; type: string }>(
+    `SELECT config, type FROM alert_channels WHERE id = $1`,
+    [id]
+  );
+  if (!existing[0]) return res.status(404).json({ error: 'Channel not found' });
+
+  const existingConfig = existing[0].config as Record<string, unknown>;
+  const type           = existing[0].type;
+
+  // Merge new config over existing, preserving existing passwords when placeholders sent
+  const merge = mergeConfig(type, existingConfig, config ?? {});
+  if ('error' in merge) return res.status(400).json({ error: merge.error });
+  const mergedConfig = merge.merged;
+
+  const rows = await query(
+    `UPDATE alert_channels
+     SET name = COALESCE($2, name),
+         enabled = COALESCE($3, enabled),
+         config = $4,
+         updated_at = NOW()
+     WHERE id = $1 RETURNING *`,
+    [id, name ?? null, enabled !== undefined ? Boolean(enabled) : null, JSON.stringify(sealConfig(type, mergedConfig))]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'Channel not found' });
+
+  const ch = rows[0] as Record<string, unknown>;
+  res.json({ ...ch, config: maskConfig(type, mergedConfig) });
+});
+
+/** DELETE /api/alerts/channels/:id */
+router.delete('/channels/:id', requireWrite, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  await query(`DELETE FROM alert_channels WHERE id = $1`, [id]);
+  res.status(204).end();
+});
+
+/** POST /api/alerts/channels/:id/test */
+router.post('/channels/:id/test', requireWrite, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  try {
+    await alertService.testChannel(id);
+    res.json({ message: 'Test alert sent successfully' });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
+
+// ── Alert History ──────────────────────────────────────────────────────────
+
+/** GET /api/alerts/history?limit=50 */
+router.get('/history', async (req, res) => {
+  const limit = Math.min(parseInt(String(req.query.limit ?? 50), 10), 200);
+  const rows = await query(
+    `SELECT h.id, h.event_type, h.device_id, h.device_name, h.message,
+            h.channels_notified, h.sent_at
+     FROM alert_history h
+     ORDER BY h.sent_at DESC LIMIT $1`,
+    [limit]
+  );
+  res.json(rows);
+});
+
+export default router;

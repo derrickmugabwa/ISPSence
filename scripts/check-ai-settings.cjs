@@ -1,0 +1,50 @@
+const assert=require('node:assert/strict');
+const {randomUUID,randomBytes}=require('node:crypto');
+const {Pool}=require('pg');
+async function main(){
+  const schema='ai_settings_lab_'+randomUUID().replace(/-/g,'');process.env.ENCRYPTION_KEY=randomBytes(32).toString('hex');process.env.SECRETS_DIR='/tmp/'+schema;
+  const url=new URL(process.env.DATABASE_URL);if(process.env.DB_PASSWORD)url.password=encodeURIComponent(process.env.DB_PASSWORD);
+  const control=new Pool({connectionString:url.toString(),options:'-c search_path=public'});let pool;
+  try{
+    await control.query('CREATE SCHEMA "'+schema+'"');process.env.PGOPTIONS='-c search_path='+schema;
+    ({pool}=require('/app/dist/config/database'));
+    const sql=require('/app/dist/modules/ai/schema').AI_SETTINGS_SCHEMA;await pool.query(sql);await pool.query(sql);
+    const ai=require('/app/dist/modules/ai/settings'),{decrypt}=require('/app/dist/utils/crypto');
+    const denied=p=>assert.rejects(p,e=>[400,404,409].includes(e.status));
+    const key='fixture-'+randomBytes(20).toString('hex');
+    let s=await ai.aiSettings();assert.equal(s.version,0);assert.equal(s.connections.length,0);
+    const body={version:0,provider:'deepseek',label:'Fictional DeepSeek',enabled:true,models:['fixture-chat'],api_key:key};
+    s=await ai.saveAiConnection(null,body,'fixture');const first=s.connections[0];
+    assert.equal(first.credentials_configured,true);assert.ok(!JSON.stringify(s).includes(key));assert.ok(!JSON.stringify(s).includes('credentials_encrypted'));
+    let encrypted=(await pool.query('SELECT credentials_encrypted FROM ai_connections WHERE id=$1',[first.id])).rows[0].credentials_encrypted;
+    assert.notEqual(encrypted,key);assert.equal(decrypt(encrypted),key);
+    await denied(ai.saveAiConnection(null,body,'fixture'));assert.equal((await ai.aiSettings()).connections.length,1);
+    const defaults={version:s.version,default_connection_id:first.id,default_model:'fixture-chat',requests_per_user_day:50,max_output_tokens:4096,max_tool_steps:5,retention_days:30};
+    s=await ai.saveAiDefaults(defaults,'fixture');await denied(ai.saveAiDefaults({...defaults,version:s.version,default_model:'unknown'},'fixture'));
+    await denied(ai.saveAiConnection(first.id,{...body,version:s.version,enabled:false,api_key:''},'fixture'));
+    await denied(ai.saveAiConnection(first.id,{...body,version:s.version,provider:'openai'},'fixture'));
+    await denied(ai.saveAiDefaults({...defaults,version:s.version,max_tool_steps:100},'fixture'));
+    s=await ai.saveAiConnection(first.id,{...body,version:s.version,label:'Retained key',api_key:''},'fixture');
+    assert.equal((await pool.query('SELECT credentials_encrypted FROM ai_connections WHERE id=$1',[first.id])).rows[0].credentials_encrypted,encrypted);
+    const transport=async()=>new Response(JSON.stringify({data:[{id:'fixture-chat'},{id:'fixture-other'}]}));
+    const checked=await ai.testAiConnection(first.id,{version:s.connections[0].version},'fixture',transport);assert.equal(checked.connected,true);
+    s=await ai.aiSettings();assert.equal(s.connection_checks_today,1);assert.deepEqual(s.connections[0].available_models,['fixture-chat','fixture-other']);
+    const failed=await ai.testAiConnection(first.id,{version:s.connections[0].version},'fixture',async()=>new Response('secret provider body',{status:401}));assert.equal(failed.code,'authentication_failed');
+    await denied(ai.testAiConnection(first.id,{version:1},'fixture',transport));
+    s=await ai.aiSettings();s=await ai.saveAiDefaults({...defaults,version:s.version,default_connection_id:null,default_model:null},'fixture');
+    const oldVersion=s.connections[0].version;
+    let release,started;const entered=new Promise(r=>started=r),waiting=new Promise(r=>release=r);
+    const pending=ai.testAiConnection(first.id,{version:oldVersion},'fixture',async()=>{started();await waiting;return new Response(JSON.stringify({data:[{id:'stale'}]}));});
+    await entered;s=await ai.saveAiConnection(first.id,{...body,version:s.version,enabled:false,api_key:'replacement-fixture-key'},'fixture');release();await denied(pending);
+    assert.equal(s.connections[0].last_test_at,null);assert.deepEqual(s.connections[0].available_models,[]);
+    s=await ai.saveAiConnection(first.id,{...body,version:s.version,enabled:false,api_key:'',remove_credentials:true},'fixture');assert.equal(s.connections[0].credentials_configured,false);
+    await denied(ai.testAiConnection(first.id,{version:s.connections[0].version},'fixture',transport));
+    await denied(ai.saveAiConnection(first.id,{...body,version:s.version,api_key:''},'fixture'));
+    const before=s.version;const raced=await Promise.allSettled([ai.saveAiConnection(null,{...body,version:before,label:'Concurrent A'},'fixture'),ai.saveAiConnection(null,{...body,version:before,label:'Concurrent B'},'fixture')]);assert.equal(raced.filter(r=>r.status==='fulfilled').length,1);
+    s=await ai.aiSettings();s=await ai.deleteAiConnection(first.id,{version:s.version},'fixture');assert.equal(s.connections.length,1);
+    const last=s.connections[0];s=await ai.saveAiDefaults({...defaults,version:s.version,default_connection_id:last.id},'fixture');s=await ai.deleteAiConnection(last.id,{version:s.version},'fixture');assert.equal(s.default_connection_id,null);assert.equal(s.default_model,null);
+    const events=JSON.stringify((await pool.query('SELECT * FROM ai_settings_events')).rows);assert.ok(!events.includes(key));assert.ok(!events.includes('replacement-fixture-key'));assert.ok(!events.includes('secret provider body'));
+    console.log('PASS: repeatable AI schema, encrypted/redacted credentials, default invariants, stale/concurrent writes, secret preservation/replacement/removal, bounded provider checks, stale-result rejection, deletion and sanitized audit');
+  }finally{if(pool)await pool.end();await control.query('DROP SCHEMA IF EXISTS "'+schema+'" CASCADE');await control.end();}
+}
+main().catch(e=>{console.error(e.message);process.exitCode=1;});

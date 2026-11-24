@@ -1,0 +1,570 @@
+import { Router, Request, Response } from 'express';
+import { decodedPath } from '../utils/requestPath';
+import * as dgram from 'dgram';
+import { query } from '../config/database';
+import { logSafe } from '../utils/logSafe';
+import { requireAuth, requireAdmin, requireWrite } from '../middleware/auth';
+import { siteList, siteScopeByDevice, siteScopeByNullableDevice } from '../utils/siteScope';
+import { fluxDeviceFilter } from '../utils/siteAccess';
+import { activeSite, writableScope } from '../middleware/site';
+import { PollerService } from '../services/PollerService';
+import { getQueryApi, bucket } from '../config/influxdb';
+import { fingerprintClient, DEVICE_CATEGORIES, DeviceCategory } from '../utils/clientFingerprint';
+import { parseRoamLine, buildSessions, flappingSessions } from '../utils/roaming';
+import { fluxString } from '@influxdata/influxdb-client';
+import { counterDeltas } from '../utils/counterDeltas';
+
+// Effective category: the user's override wins; otherwise the fingerprint.
+function withCategory<T extends Record<string, unknown>>(row: T): T & { device_category: string; auto_category: string } {
+  const auto = fingerprintClient({
+    vendor: row['vendor'] as string | null,
+    hostname: row['hostname'] as string | null,
+    custom_name: row['custom_name'] as string | null,
+  });
+  const custom = (row['custom_category'] as string | null) || null;
+  return { ...row, device_category: custom ?? auto, auto_category: auto };
+}
+
+const router = Router();
+router.use(requireAuth);
+
+// A site-scoped account reaches a client only if it has been seen on one of
+// its devices (P1-7). The per-client queries below are site-filtered as well.
+router.use(async (req: Request, res: Response, next) => {
+  const scoped = req.user?.siteRoles;
+  // Decoded, as the handler's :mac is (GHSA-6xq3-q9m5-7hxp); undecodable is refused.
+  const path = decodedPath(req);
+  if (scoped && path === null) return res.status(400).json({ error: 'Malformed request path' });
+  const m = /^\/([0-9A-Fa-f:.-]{12,17})(?:\/|$)/.exec(path ?? '');
+  if (!scoped || !m) return next();
+  const seen = siteScopeByDevice(Object.keys(scoped).map(Number), 'device_id');
+  const rows = await query(`SELECT 1 FROM clients WHERE LOWER(mac_address) = LOWER($1) AND ${seen} LIMIT 1`, [m[1]]).catch(() => []);
+  if (rows.length === 0) return res.status(404).json({ error: 'Client not found' });
+  return next();
+});
+
+let pollerService: PollerService | null = null;
+export function setPollerService(p: PollerService): void { pollerService = p; }
+
+/**
+ * GET /api/clients/:mac/roaming — reconstruct this client's wireless sessions.
+ *
+ * Built from log lines already collected into `events`, so it needs no new
+ * collection and works retroactively over whatever history exists. Roaming happens
+ * between polls, so the log is the only place it is visible at all (issue #105).
+ */
+router.get('/:mac/roaming', async (req: Request, res: Response) => {
+  const mac = String(req.params.mac).toUpperCase();
+  if (!/^[0-9A-F:]{17}$/.test(mac)) return res.status(400).json({ error: 'Invalid MAC address' });
+
+  const range = String(req.query.range || '24h');
+  const hours = range === '7d' ? 168 : range === '30d' ? 720 : range === '1h' ? 1 : 24;
+
+  // Time-bounded first so the scan stays small — most of an events table is login
+  // noise. Both message shapes are matched: wireless lines start with the MAC,
+  // DHCP lines carry it mid-string.
+  const rows = await query<{ event_time: string; message: string; device_name: string | null }>(
+    `SELECT e.event_time, e.message, d.name AS device_name
+     FROM events e
+     LEFT JOIN devices d ON d.id = e.device_id
+     WHERE e.event_time > NOW() - ($2 || ' hours')::interval
+       AND (e.message ILIKE $1 || '@%' OR e.message ILIKE '%for ' || $1 || '%')
+       ${siteScopeByNullableDevice(activeSite(req), 'e.device_id') ? `AND ${siteScopeByNullableDevice(activeSite(req), 'e.device_id')}` : ''}
+     ORDER BY e.event_time ASC
+     LIMIT 5000`,
+    [mac, String(hours)]
+  );
+
+  const events = rows
+    .map((r) => parseRoamLine(r.message, new Date(r.event_time).toISOString(), r.device_name))
+    .filter((e): e is NonNullable<typeof e> => e !== null && e.mac === mac);
+
+  const sessions = buildSessions(events);
+  const flapping = flappingSessions(sessions);
+
+  res.json({
+    mac,
+    range,
+    sessions: [...sessions].reverse(),          // newest first for display
+    totalRoams: sessions.reduce((n, s) => n + s.hops.length, 0),
+    flappingSessions: flapping.length,
+    /** Radios this client has been seen on, most-used first. */
+    radios: Object.entries(
+      sessions.flatMap((s) => s.path).reduce<Record<string, number>>((acc, i) => {
+        acc[i] = (acc[i] ?? 0) + 1;
+        return acc;
+      }, {})
+    ).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count })),
+  });
+});
+
+// GET /api/clients
+router.get('/', async (req: Request, res: Response) => {
+  const {
+    deviceId, active, search, client_type, limit = '100', offset = '0', sort, dir,
+    vlan_id, signal_min, signal_max,
+  } = req.query;
+
+  // Whitelist sortable columns → safe SQL expressions on the outer (deduped)
+  // result. Sorting must run server-side across the whole dataset, not just the
+  // current page, or column sorts appear to do nothing when a page is uniform.
+  const SORT_EXPR: Record<string, string> = {
+    hostname: `LOWER(COALESCE(NULLIF(deduped.custom_name, ''), deduped.hostname, ''))`,
+    vendor: `LOWER(COALESCE(deduped.vendor, ''))`,
+    // Regex-guard the inet cast so non-IP/empty values can't error; sorts numerically.
+    ip_address: `CASE WHEN deduped.ip_address ~ '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$' THEN deduped.ip_address::inet END`,
+    client_type: `deduped.client_type`,
+    interface_name: `LOWER(COALESCE(deduped.interface_name, ''))`,
+    vlan_id: `deduped.vlan_id`,
+    device_name: `LOWER(COALESCE(deduped.device_name, ''))`,
+    traffic_today_bytes: `traffic_today_bytes`,
+    last_seen: `deduped.last_seen`,
+    // Asked for by Stanley (discussion #85). Wired clients have no SSID or
+    // signal; NULLIF keeps a blank SSID NULL so NULLS LAST puts them at the end
+    // in both directions. Signal is dBm, so descending is strongest first.
+    ssid: `LOWER(NULLIF(deduped.ssid, ''))`,
+    signal_strength: `deduped.signal_strength`,
+    // #252: link rate, from the access point's side (tx = towards the client).
+    tx_rate_bps: `deduped.tx_rate_bps`,
+  };
+  const sortExpr = SORT_EXPR[String(sort)] ?? SORT_EXPR.last_seen;
+  const sortDir = String(dir).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  // Stable, predictable: chosen column, then mac as a deterministic tiebreaker.
+  const orderBy = `ORDER BY ${sortExpr} ${sortDir} NULLS LAST, deduped.mac_address ASC`;
+
+  // Filters split across the deduplication boundary, and the split is the whole
+  // point of this block.
+  //
+  // A MAC can carry several rows — one per device that has seen it — and the
+  // DISTINCT ON below reduces them to the single row the table displays. Which
+  // side a filter belongs on therefore depends on what it means:
+  //
+  //   * Filters that choose which *sightings* to consider (device, active) run
+  //     before, so they shape what deduplication has to pick from.
+  //   * Filters on values the table *shows* (type, VLAN, signal) run after, or
+  //     the filter and the column disagree.
+  //
+  // Both halves matter here. A wireless client's MAC is also learned by the
+  // switch its AP uplinks to, so it holds both a wireless and a wired row — on
+  // this fleet all 13 wireless clients do — and deduplication resolves that in
+  // favour of wireless. Filtering the raw rows returned every one of them under
+  // "wired" while the list showed them as wireless. Equally, a client seen by two
+  // APs at different strengths would appear in a signal band its displayed row is
+  // not in (#100).
+  const filters: string[] = [];
+  const outerFilters: string[] = [];
+  const filterParams: unknown[] = [];
+  let idx = 1;
+
+  // ── Before deduplication: which sightings count ──
+  if (deviceId) {
+    filters.push(`c.device_id = $${idx++}`);
+    filterParams.push(deviceId);
+  }
+  // Site scoping belongs on the sighting side: a MAC seen by a device in
+  // another site is that site's client, not this one's. Expressed as a
+  // subquery on device_id rather than d.site_id because the count query below
+  // does not join devices (issue #130).
+  const siteFilter = siteScopeByDevice(activeSite(req), 'c.device_id');
+  if (siteFilter) filters.push(siteFilter);
+  if (active === 'true') {
+    filters.push(`c.active = TRUE`);
+  }
+  if (search) {
+    filters.push(`(c.mac_address ILIKE $${idx} OR c.custom_name ILIKE $${idx} OR c.hostname ILIKE $${idx} OR c.ip_address ILIKE $${idx} OR c.vendor ILIKE $${idx})`);
+    filterParams.push(`%${search}%`);
+    idx++;
+  }
+
+  // The sighting filters alone, for the VLAN choices below.
+  const preParams = [...filterParams];
+
+  // ── After deduplication: must match the row on screen ──
+  if (client_type) {
+    outerFilters.push(`deduped.client_type = $${idx++}`);
+    filterParams.push(client_type);
+  }
+  if (vlan_id) {
+    outerFilters.push(`deduped.vlan_id = $${idx++}`);
+    filterParams.push(vlan_id);
+  }
+  // Signal range, so the AP-density chart can hand off the band the user clicked
+  // (issues #99, #100). Bounds are inclusive of min and exclusive of max, matching
+  // how the density buckets are drawn.
+  if (signal_min) {
+    outerFilters.push(`deduped.signal_strength >= $${idx++}`);
+    filterParams.push(Number(signal_min));
+  }
+  if (signal_max) {
+    outerFilters.push(`deduped.signal_strength < $${idx++}`);
+    filterParams.push(Number(signal_max));
+  }
+  // Category is deliberately absent. The effective category is the user's override
+  // where set, otherwise a fingerprint computed in JS from vendor and hostname
+  // (utils/clientFingerprint) — there is no column to filter on, and filtering after
+  // pagination would produce wrong counts. Persisting the fingerprint would fix it,
+  // at the cost of going stale whenever the rules change.
+
+  const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+  // Integers from the site scope, safe to inline.
+  const trafficSites = siteList(activeSite(req))?.filter((n) => Number.isSafeInteger(n)) ?? null;
+  const outerWhere = outerFilters.length ? `WHERE ${outerFilters.join(' AND ')}` : '';
+
+  // Deduplicate by MAC address across devices: prefer active rows, then most recently seen.
+  // The inner DISTINCT ON picks the best row per MAC; the outer query applies final sort + pagination.
+  const sql = `
+    SELECT deduped.*,
+           -- float8 so node-pg returns a number (bigint would arrive as a string)
+           COALESCE(ctd.bytes, 0)::float8 AS traffic_today_bytes
+    FROM (
+      SELECT DISTINCT ON (c.mac_address)
+        c.*, d.name as device_name,
+        wi.ssid as ssid
+      FROM clients c
+      JOIN devices d ON d.id = c.device_id
+      LEFT JOIN wireless_interfaces wi
+        ON wi.device_id = c.device_id AND wi.name = c.interface_name
+      ${where}
+      ORDER BY c.mac_address, c.active DESC, (c.client_type = 'wireless') DESC, c.last_seen DESC NULLS LAST
+    ) deduped
+    -- Today's traffic is kept per site (J4): add up the sites in view.
+    LEFT JOIN (
+      SELECT mac_address, SUM(upload_bytes + download_bytes) AS bytes
+        FROM client_traffic_daily
+       WHERE day = CURRENT_DATE ${trafficSites ? `AND site_id = ANY(ARRAY[${trafficSites.join(',')}]::int[])` : ''}
+       GROUP BY mac_address
+    ) ctd ON ctd.mac_address = LOWER(deduped.mac_address)
+    ${outerWhere}
+    ${orderBy}
+    LIMIT $${idx++} OFFSET $${idx}
+  `;
+  const clients = await query(sql, [...filterParams, parseInt(String(limit), 10), parseInt(String(offset), 10)]);
+
+  const countResult = await query<{ total: string }>(
+    `SELECT COUNT(*) as total FROM (
+       SELECT DISTINCT ON (c.mac_address) c.client_type, c.vlan_id, c.signal_strength
+       FROM clients c
+       ${where}
+       ORDER BY c.mac_address, c.active DESC, (c.client_type = 'wireless') DESC, c.last_seen DESC NULLS LAST
+     ) deduped
+     ${outerWhere}`,
+    filterParams
+  );
+
+  // Every VLAN among the clients in view, not just this page's, so the filter
+  // offers all of them (outside review U14). The VLAN filter itself isn't
+  // applied, or choosing one would hide the others.
+  const vlanRows = await query<{ vlan_id: number }>(
+    `SELECT DISTINCT deduped.vlan_id FROM (
+       SELECT DISTINCT ON (c.mac_address) c.vlan_id
+       FROM clients c
+       ${where}
+       ORDER BY c.mac_address, c.active DESC, (c.client_type = 'wireless') DESC, c.last_seen DESC NULLS LAST
+     ) deduped
+     WHERE deduped.vlan_id IS NOT NULL
+     ORDER BY 1`,
+    preParams
+  ).catch(() => []);
+
+  res.json({
+    clients: (clients as Record<string, unknown>[]).map(withCategory),
+    total: parseInt(countResult[0]?.total || '0', 10),
+    vlans: vlanRows.map((v) => v.vlan_id),
+  });
+});
+
+// GET /api/clients/:mac — detail view with SSID, VLAN name, device type, upstream topology
+router.get('/:mac', async (req: Request, res: Response) => {
+  const mac = req.params.mac.toLowerCase();
+
+  // Order: active records first, then wireless before wired (the AP knows the
+  // client best), then most recently seen. Wireless first regardless let a
+  // stale wireless sighting outrank a live wired one (outside review J7). Use LATERAL for topology so we never multiply rows.
+  const rows = await query<Record<string, unknown>>(
+    `SELECT c.*, d.name as device_name, d.device_type,
+            wi.ssid as ssid,
+            v.name as vlan_name,
+            topo.upstream_device_id,
+            topo.upstream_interface,
+            topo.upstream_device_name,
+            topo.upstream_device_type,
+            topo.upstream_device_ip
+     FROM clients c
+     JOIN devices d ON d.id = c.device_id
+     LEFT JOIN wireless_interfaces wi
+       ON wi.device_id = c.device_id AND wi.name = c.interface_name
+     LEFT JOIN vlans v
+       ON v.device_id = c.device_id AND v.vlan_id = c.vlan_id
+     LEFT JOIN LATERAL (
+       SELECT tl.to_device_id   AS upstream_device_id,
+              tl.to_interface   AS upstream_interface,
+              ud.name           AS upstream_device_name,
+              ud.device_type    AS upstream_device_type,
+              ud.ip_address     AS upstream_device_ip
+       FROM topology_links tl
+       JOIN devices ud ON ud.id = tl.to_device_id
+       WHERE tl.from_device_id = c.device_id
+       -- The device's way up: its spanning-tree root port when it has one,
+       -- rather than whichever link the database returned first (J7).
+       ORDER BY (tl.stp_role = 'root') DESC NULLS LAST, tl.id
+       LIMIT 1
+     ) topo ON TRUE
+     WHERE LOWER(c.mac_address) = $1
+       ${siteScopeByDevice(activeSite(req), 'c.device_id') ? `AND ${siteScopeByDevice(activeSite(req), 'c.device_id')}` : ''}
+     ORDER BY c.active DESC, (c.client_type = 'wireless') DESC, c.last_seen DESC NULLS LAST
+     LIMIT 1`,
+    [mac]
+  );
+
+  if (!rows.length) return res.status(404).json({ error: 'Client not found' });
+  return res.json(withCategory(rows[0]));
+});
+
+// GET /api/clients/:mac/presence?range=2h|24h|7d — connectivity timeline from InfluxDB
+router.get('/:mac/presence', async (req: Request, res: Response) => {
+  const mac = req.params.mac.toLowerCase();
+  const rangeRaw = String(req.query.range || '24h');
+  const allowedRanges: Record<string, string> = { '2h': '2h', '24h': '24h', '7d': '7d' };
+  const range = allowedRanges[rangeRaw] || '24h';
+
+  // Window size: 5m for 2h/24h, 30m for 7d
+  const window = range === '7d' ? '30m' : '5m';
+
+  const queryApi = getQueryApi();
+  const deviceFlux = await fluxDeviceFilter(activeSite(req));
+  // Group by mac_address only (drop device_id) so that all devices reporting the
+  // same client are merged into one series. fn:max means online=1 if any device
+  // saw the client in that window; createEmpty+fill gives offline=0 for gaps.
+  const fluxQuery = `
+    from(bucket: "${bucket}")
+      |> range(start: -${range})
+      |> filter(fn: (r) => r._measurement == "client_presence")
+      |> filter(fn: (r) => r._field == "online")
+      |> filter(fn: (r) => r.mac_address == ${fluxString(String(mac))})
+      ${deviceFlux}
+      |> group(columns: ["_measurement", "_field", "mac_address"])
+      |> aggregateWindow(every: ${window}, fn: max, createEmpty: true)
+      |> fill(value: 0)
+      |> yield(name: "presence")
+  `;
+
+  const points: { time: string; online: number }[] = [];
+  try {
+    await queryApi.collectRows(fluxQuery, (row, tableMeta) => {
+      const time = tableMeta.get(row, '_time') as string;
+      const value = tableMeta.get(row, '_value') as number;
+      points.push({ time, online: value != null ? Math.round(value) : 0 });
+    });
+  } catch {
+    // InfluxDB not available or no data yet
+  }
+
+  return res.json(points);
+});
+
+// GET /api/clients/:mac/traffic?range=2h|24h|7d — wireless tx/rx rate graph
+router.get('/:mac/traffic', async (req: Request, res: Response) => {
+  const mac = req.params.mac.toLowerCase();
+  const rangeRaw = String(req.query.range || '24h');
+  const allowedRanges: Record<string, string> = { '2h': '2h', '24h': '24h', '7d': '7d' };
+  const range = allowedRanges[rangeRaw] || '24h';
+
+  const window = range === '7d' ? '30m' : '5m';
+
+  const queryApi = getQueryApi();
+  const deviceFlux = await fluxDeviceFilter(activeSite(req));
+  // Simple query: get the last cumulative byte counter value per time window.
+  // Non-negative differences are computed in TypeScript below — avoids the
+  // fragile non_negative_difference+pivot combination in Flux.
+  const fluxQuery = `
+    from(bucket: "${bucket}")
+      |> range(start: -${range})
+      |> filter(fn: (r) => r._measurement == "client_presence")
+      |> filter(fn: (r) => r._field == "tx_bytes" or r._field == "rx_bytes")
+      |> filter(fn: (r) => r.mac_address == ${fluxString(String(mac))})
+      ${deviceFlux}
+      |> group(columns: ["_measurement", "_field", "mac_address", "device_id"])
+      |> aggregateWindow(every: ${window}, fn: last, createEmpty: false)
+      |> yield(name: "traffic_raw")
+  `;
+
+  // Each device keeps its own byte counter for a client, so deltas are taken
+  // per device and only then added up. Taking them across a merged series
+  // subtracted one access point's counter from another's (J4).
+  const raw: { time: string; field: string; device: string; value: number }[] = [];
+  try {
+    await queryApi.collectRows(fluxQuery, (row, tableMeta) => {
+      const time   = tableMeta.get(row, '_time')  as string;
+      const field  = tableMeta.get(row, '_field') as string;
+      const device = String(tableMeta.get(row, 'device_id') ?? '');
+      const value  = tableMeta.get(row, '_value') as number;
+      if (time && field && value != null) raw.push({ time, field, device, value });
+    });
+  } catch (err) {
+    // Literal format string, value as an argument: with a template here, a mac
+    // containing "%s" would turn the message into a format string and consume
+    // `err` as its substitution (CodeQL js/tainted-format-string).
+    console.error('[clients/traffic] Flux error for %s:', logSafe(mac), err);
+  }
+
+  const txDeltas = counterDeltas(raw.filter(p => p.field === 'tx_bytes'));
+  const rxDeltas = counterDeltas(raw.filter(p => p.field === 'rx_bytes'));
+
+  const allTimes = new Set([...txDeltas.keys(), ...rxDeltas.keys()]);
+  const points = [...allTimes].sort().map(time => ({
+    time,
+    tx_bytes: txDeltas.get(time) ?? 0,
+    rx_bytes: rxDeltas.get(time) ?? 0,
+  }));
+
+  return res.json(points);
+});
+
+// GET /api/clients/:mac/signal?range=2h|24h|7d — signal strength over time
+router.get('/:mac/signal', async (req: Request, res: Response) => {
+  const mac = req.params.mac.toLowerCase();
+  const rangeRaw = String(req.query.range || '24h');
+  const allowedRanges: Record<string, string> = { '2h': '2h', '24h': '24h', '7d': '7d' };
+  const range = allowedRanges[rangeRaw] || '24h';
+
+  const window = range === '7d' ? '30m' : '5m';
+
+  const queryApi = getQueryApi();
+  const deviceFlux = await fluxDeviceFilter(activeSite(req));
+  const fluxQuery = `
+    from(bucket: "${bucket}")
+      |> range(start: -${range})
+      |> filter(fn: (r) => r._measurement == "client_presence")
+      |> filter(fn: (r) => r._field == "signal_strength")
+      |> filter(fn: (r) => r.mac_address == ${fluxString(String(mac))})
+      ${deviceFlux}
+      |> group(columns: ["_measurement", "_field", "mac_address"])
+      |> aggregateWindow(every: ${window}, fn: mean, createEmpty: false)
+      |> yield(name: "signal")
+  `;
+
+  const points: { time: string; signal_strength: number }[] = [];
+  try {
+    await queryApi.collectRows(fluxQuery, (row, tableMeta) => {
+      const time  = tableMeta.get(row, '_time')  as string;
+      const value = tableMeta.get(row, '_value') as number;
+      if (time && value != null) points.push({ time, signal_strength: Math.round(value) });
+    });
+  } catch (err) {
+    // Literal format string, value as an argument: with a template here, a mac
+    // containing "%s" would turn the message into a format string and consume
+    // `err` as its substitution (CodeQL js/tainted-format-string).
+    console.error('[clients/signal] Flux error for %s:', logSafe(mac), err);
+  }
+
+  return res.json(points);
+});
+
+// POST /api/clients/:mac/wol — send Wake-on-LAN magic packet
+router.post('/:mac/wol', requireWrite, async (req: Request, res: Response) => {
+  const mac = req.params.mac.replace(/[^0-9a-fA-F:.-]/g, '');
+  const hexMac = mac.replace(/[:\-.]/g, '');
+  if (hexMac.length !== 12) {
+    return res.status(400).json({ error: 'Invalid MAC address' });
+  }
+
+  // Only for a client the account can see (P1-7).
+  const scope = siteScopeByDevice(activeSite(req), 'device_id');
+  if (scope) {
+    const seen = await query(`SELECT 1 FROM clients WHERE REPLACE(REPLACE(LOWER(mac_address), ':', ''), '-', '') = $1 AND ${scope} LIMIT 1`, [hexMac.toLowerCase()]);
+    if (seen.length === 0) return res.status(404).json({ error: 'Client not found' });
+  }
+
+  // Build magic packet: 6 bytes of 0xFF + MAC repeated 16 times
+  const macBytes = Buffer.from(hexMac, 'hex');
+  const magic = Buffer.alloc(102);
+  magic.fill(0xff, 0, 6);
+  for (let i = 0; i < 16; i++) {
+    macBytes.copy(magic, 6 + i * 6);
+  }
+
+  return new Promise<void>((resolve) => {
+    const socket = dgram.createSocket('udp4');
+    socket.once('error', (err) => {
+      socket.close();
+      res.status(500).json({ error: `WoL send failed: ${err.message}` });
+      resolve();
+    });
+    socket.bind(() => {
+      socket.setBroadcast(true);
+      socket.send(magic, 0, magic.length, 9, '255.255.255.255', (err) => {
+        socket.close();
+        if (err) {
+          res.status(500).json({ error: `WoL send failed: ${err.message}` });
+        } else {
+          res.json({ success: true, message: `Magic packet sent to ${mac}` });
+        }
+        resolve();
+      });
+    });
+  });
+});
+
+/**
+ * Restricts a client edit to the records in the sites the account can write
+ * to (P1-7, J4). A MAC can be on record at several sites; an edit made in one
+ * must not rename or annotate another customer's record of it. '' when
+ * unscoped. Site ids are integers, safe to inline.
+ */
+function inScope(req: Request): string {
+  const pred = siteScopeByDevice(writableScope(req), 'device_id');
+  return pred ? `AND ${pred}` : '';
+}
+
+// PUT /api/clients/:mac/hostname  (writes to custom_name — user-set names persist across collector cycles)
+router.put('/:mac/hostname', requireWrite, async (req: Request, res: Response) => {
+  const { hostname } = req.body as { hostname?: string };
+  const mac = req.params.mac.toLowerCase();
+
+  const result = await query(
+    `UPDATE clients SET custom_name = $1 WHERE LOWER(mac_address) = $2 ${inScope(req)} RETURNING *`,
+    [hostname || null, mac]
+  );
+  if (!result.length) return res.status(404).json({ error: 'Client not found' });
+  return res.json(result[0]);
+});
+
+// PUT /api/clients/:mac/category — override (or clear) the fingerprinted device category
+router.put('/:mac/category', requireWrite, async (req: Request, res: Response) => {
+  const { category } = req.body as { category?: string | null };
+  const mac = req.params.mac.toLowerCase();
+
+  const clear = category === null || category === undefined || category === '';
+  if (!clear && !DEVICE_CATEGORIES.includes(category as DeviceCategory)) {
+    return res.status(400).json({ error: `category must be one of: ${DEVICE_CATEGORIES.join(', ')} (or null to revert to automatic)` });
+  }
+
+  const result = await query(
+    `UPDATE clients SET custom_category = $1 WHERE LOWER(mac_address) = $2 ${inScope(req)} RETURNING *`,
+    [clear ? null : category, mac]
+  );
+  if (!result.length) return res.status(404).json({ error: 'Client not found' });
+  return res.json(withCategory(result[0] as Record<string, unknown>));
+});
+
+// PUT /api/clients/:mac/notes — update the comment/notes field
+router.put('/:mac/notes', requireWrite, async (req: Request, res: Response) => {
+  const { notes } = req.body as { notes?: string };
+  const mac = req.params.mac.toLowerCase();
+
+  const result = await query(
+    `UPDATE clients SET comment = $1 WHERE LOWER(mac_address) = $2 ${inScope(req)} RETURNING *`,
+    [notes ?? null, mac]
+  );
+  if (!result.length) return res.status(404).json({ error: 'Client not found' });
+  return res.json(result[0]);
+});
+
+// POST /api/clients/purge — immediately delete inactive clients older than retention period
+router.post('/purge', requireAdmin, async (_req: Request, res: Response) => {
+  if (!pollerService) return res.status(503).json({ error: 'Poller not available' });
+  const count = await pollerService.pruneStaleClientsNow();
+  return res.json({ message: `Purged ${count} stale client record(s)`, count });
+});
+
+export default router;

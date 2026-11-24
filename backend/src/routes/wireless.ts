@@ -1,0 +1,1130 @@
+import { Router, Request, Response } from 'express';
+import { wirelessDeviceSql } from '../services/mikrotik/capsman';
+import { deviceSiteAccess, deviceIdParam, deviceIdQuery, devicesDenied } from '../utils/siteAccess';
+import { deviceWriteLock, deviceIdFromPath } from '../services/changeGuard/deviceLock';
+import { withGuardedChange } from '../services/changeGuard/guardedRoute';
+import { query } from '../config/database';
+import { requireAuth, requireWrite } from '../middleware/auth';
+import { maskSecretsForReadOnly } from '../utils/redactSecrets';
+import { siteScopeDevices, siteScopeByDevice } from '../utils/siteScope';
+import { activeSite } from '../middleware/site';
+import { DeviceCollector, DeviceRow } from '../services/mikrotik/DeviceCollector';
+import { lookupVendor } from '../utils/oui';
+import { analyzeSpectrum, summarize, BAND_RANGES, parseChannelSpec } from '../utils/rfSpectrum';
+import { fluxString } from '@influxdata/influxdb-client';
+
+const router = Router();
+router.use(requireAuth);
+// A site-scoped account only reaches devices in its own sites, with its role there (P1-7).
+router.use(deviceSiteAccess(deviceIdParam));
+
+// The :id a handler acts on must be the plain number the site check read
+// (GHSA-6xq3-q9m5-7hxp); anything else is answered as not found.
+router.param('id', (_req, res, next, id) => {
+  if (!/^\d{1,10}$/.test(String(id))) { res.status(404).json({ error: 'Device not found' }); return; }
+  next();
+});
+// The fleet RF views also take ?deviceId=.
+router.use(deviceSiteAccess(deviceIdQuery));
+// Viewers and read-only tokens never receive device secrets (Wi-Fi keys,
+// WireGuard private keys, SNMP communities, hotspot passwords).
+router.use(maskSecretsForReadOnly);
+// One write at a time per device, so a Change Guard revert can't undo another write.
+router.use(deviceWriteLock(deviceIdFromPath));
+
+// ─── Helper ───────────────────────────────────────────────────────────────────
+
+async function getAP(id: number): Promise<DeviceRow | null> {
+  const rows = await query<DeviceRow>(
+    `SELECT * FROM devices WHERE id = $1 AND ${wirelessDeviceSql()}`,
+    [id]
+  );
+  return rows[0] ?? null;
+}
+
+// ─── Bulk SSID deployment ─────────────────────────────────────────────────────
+
+// POST /api/wireless/ssid/bulk — create the same SSID on multiple APs simultaneously
+router.post('/ssid/bulk', requireWrite, async (req: Request, res: Response) => {
+  const { apIds, ...ssidBody } = req.body as { apIds: number[] } & Record<string, unknown>;
+
+  if (!Array.isArray(apIds) || apIds.length === 0) {
+    return res.status(400).json({ error: '"apIds" must be a non-empty array' });
+  }
+  // Every AP must be one the caller operates (P1-7).
+  if (req.user?.siteRoles && (await devicesDenied(req.user, apIds.map(Number), 'operator')).length > 0) {
+    return res.status(404).json({ error: 'Some of those access points were not found.' });
+  }
+  if (!ssidBody.ssid) {
+    return res.status(400).json({ error: '"ssid" is required' });
+  }
+
+  const placeholders = apIds.map((_, i) => `$${i + 1}`).join(',');
+  const aps = await query<DeviceRow>(
+    `SELECT * FROM devices WHERE id IN (${placeholders}) AND ${wirelessDeviceSql()}`,
+    apIds
+  );
+
+  const settled = await Promise.allSettled(
+    aps.map(async (ap) => {
+      const collector = new DeviceCollector(ap);
+      try {
+        await collector.connect();
+        const pkg = await collector.detectWifiPackage();
+
+        // Widening the device selector so CAPsMAN controllers stop being invisible
+        // also let CAPs through here. An SSID created on a provisioned radio is
+        // discarded by the controller, so refuse rather than report success.
+        const { local: localRadios, capsmanOwned } = await collector.partitionRadios();
+        if (localRadios.length === 0 && capsmanOwned.length > 0) {
+          throw new Error(
+            `${ap.name}: every radio is provisioned by CAPsMAN (${capsmanOwned.join(', ')}). `
+            + `Add this SSID to the controller's configuration instead.`
+          );
+        }
+
+        const autoName = await collector.getNextInterfaceName();
+
+        // Normalize mode to the correct value for this AP's package type
+        let resolvedMode = String(ssidBody.mode || 'ap-bridge');
+        if (pkg === 'wifi' && (resolvedMode === 'ap-bridge' || resolvedMode === 'bridge')) {
+          resolvedMode = 'ap';
+        } else if (pkg !== 'wifi' && resolvedMode === 'ap') {
+          resolvedMode = 'ap-bridge';
+        }
+
+        const params: Record<string, string> = {
+          name: autoName,
+          ssid: String(ssidBody.ssid),
+          mode: resolvedMode,
+          disabled: ssidBody.disabled ? 'yes' : 'no',
+        };
+        const fieldMap: Record<string, string> = {
+          band: 'band', frequency: 'frequency', channel_width: 'channel-width',
+          tx_power: 'tx-power', tx_power_mode: 'tx-power-mode',
+          antenna_gain: 'antenna-gain', country: 'country', installation: 'installation',
+          security_profile: 'security-profile', passphrase: 'passphrase',
+        };
+        for (const [key, rosKey] of Object.entries(fieldMap)) {
+          if (ssidBody[key]) params[rosKey] = String(ssidBody[key]);
+        }
+        if (ssidBody.authentication_types) {
+          params['authentication-types'] = Array.isArray(ssidBody.authentication_types)
+            ? (ssidBody.authentication_types as string[]).join(',')
+            : String(ssidBody.authentication_types);
+        }
+        await collector.addWirelessInterface(params);
+        await collector.collectWirelessInterfaces();
+        return { id: ap.id, name: ap.name as string, ok: true };
+      } catch (err) {
+        return { id: ap.id, name: ap.name as string, ok: false, error: (err as Error).message };
+      } finally {
+        collector.disconnect();
+      }
+    })
+  );
+
+  const results = settled.map(r =>
+    r.status === 'fulfilled' ? r.value : { id: 0, name: 'unknown', ok: false, error: String(r.reason) }
+  );
+
+  return res.json({ results });
+});
+
+// ─── Section overview ─────────────────────────────────────────────────────────
+
+/**
+ * True for an interface on a controller that is really one of its CAPs'
+ * radios (or a virtual interface on one): the controller mirrors them locally,
+ * and capsman_radios lists them as not local (#196).
+ */
+const REMOTE_RADIO = `
+  SELECT 1 FROM capsman_radios cr
+   WHERE cr.controller_device_id = d.id AND cr.local = false
+     AND (cr.interface_name = wi.name
+          OR cr.interface_name = wi.config_json->>'master-interface'
+          OR (wi.radio_mac IS NOT NULL AND cr.radio_mac = wi.radio_mac))`;
+
+// GET /api/wireless — all wireless_ap devices with aggregated stats
+router.get('/', async (req: Request, res: Response) => {
+  const siteFilter = siteScopeDevices(activeSite(req), 'd');
+  const aps = await query(`
+    SELECT d.id, d.name, d.ip_address, d.model, d.device_type, d.status, d.last_seen,
+           d.ros_version, d.firmware_version, d.serial_number, d.rack_name, d.rack_slot,
+           -- Radios are physical interfaces only: virtual APs carry a
+           -- master-interface. And a controller's copies of its CAPs'
+           -- interfaces (remote radios in capsman_radios, and the virtual
+           -- interfaces on them) belong to the CAPs, not the controller (#196).
+           COUNT(DISTINCT wi.id) FILTER (
+             WHERE COALESCE(wi.config_json->>'master-interface', '') = ''
+               AND NOT EXISTS (${REMOTE_RADIO})
+           )                                              AS radio_count,
+           -- A CAP's own registration table is empty when the controller processes
+           -- traffic centrally, so its per-interface counts read zero. GREATEST
+           -- prefers whichever source actually has the clients without adding the
+           -- two together on a controller that is also a CAP.
+           GREATEST(
+             COALESCE(SUM(wi.registered_clients), 0),
+             COALESCE((SELECT SUM(cr.registered_peers) FROM capsman_radios cr
+                        WHERE cr.matched_device_id = d.id), 0)
+           )                                              AS client_count,
+           COUNT(DISTINCT wi.id) FILTER (
+             WHERE wi.ssid IS NOT NULL AND wi.disabled = false AND NOT EXISTS (${REMOTE_RADIO})
+           )                                              AS ssid_count
+    FROM devices d
+    LEFT JOIN wireless_interfaces wi ON wi.device_id = d.id
+    WHERE ${wirelessDeviceSql('d')}
+      ${siteFilter ? `AND ${siteFilter}` : ''}
+    GROUP BY d.id
+    ORDER BY d.name ASC
+  `);
+  res.json(aps);
+});
+
+// ─── CAPsMAN (issue #94) ──────────────────────────────────────────────────────
+
+/**
+ * GET /api/wireless/capsman — every controller in the fleet with the radios it
+ * manages, grouped by the access point each radio physically lives on.
+ *
+ * Read-only. Reads the cache rather than the devices, so the page loads instantly
+ * and works while a CAP is offline — the controller still knows what it provisioned.
+ */
+router.get('/capsman', async (req: Request, res: Response) => {
+  const siteFilter = siteScopeDevices(activeSite(req));
+  const controllers = await query<{
+    id: number; name: string; ip_address: string; model: string | null;
+    status: string; wifi_role: string | null;
+  }>(`
+    SELECT id, name, ip_address, model, status, wifi_role
+    FROM devices
+    WHERE wifi_role IN ('controller', 'controller_cap')
+      ${siteFilter ? `AND ${siteFilter}` : ''}
+    ORDER BY name ASC
+  `);
+
+  if (controllers.length === 0) return res.json({ controllers: [] });
+
+  const ids = controllers.map((c) => c.id);
+  const [radios, configs, provisioning] = await Promise.all([
+    query(`
+      SELECT r.controller_device_id, r.radio_mac, r.interface_name, r.local, r.hw_type,
+             r.current_channel, r.remote_cap_name, r.matched_device_id,
+             r.state, r.registered_peers, r.authorized_peers, r.tx_power, r.ssid,
+             d.name AS matched_device_name, d.status AS matched_device_status
+      FROM capsman_radios r
+      LEFT JOIN devices d ON d.id = r.matched_device_id
+      WHERE r.controller_device_id = ANY($1::int[])
+      ORDER BY r.local DESC, d.name NULLS LAST, r.interface_name
+    `, [ids]),
+    query(`
+      SELECT controller_device_id, name, ssid, mode, band, security, authentication_types
+      FROM capsman_configurations
+      WHERE controller_device_id = ANY($1::int[])
+      ORDER BY name
+    `, [ids]),
+    query(`
+      SELECT controller_device_id, ros_id, action, master_configuration,
+             slave_configurations, radio_mac, comment, disabled
+      FROM capsman_provisioning
+      WHERE controller_device_id = ANY($1::int[])
+      ORDER BY ros_id
+    `, [ids]),
+  ]);
+
+  // Interfaces provisioned onto the CAPs, joined to their radio so the UI can show
+  // one row per interface with the access point it lives on.
+  const interfaces = await query(`
+    SELECT wi.device_id, wi.name, wi.ssid, wi.band, wi.frequency, wi.disabled, wi.running,
+           wi.managed_by_capsman, wi.radio_mac, wi.registered_clients, d.name AS device_name
+    FROM wireless_interfaces wi
+    JOIN devices d ON d.id = wi.device_id
+    WHERE wi.managed_by_capsman = TRUE
+    ORDER BY d.name, wi.name
+  `);
+
+  const byController = <T extends { controller_device_id: number }>(rows: T[], id: number) =>
+    rows.filter((r) => r.controller_device_id === id);
+
+  res.json({
+    controllers: controllers.map((c) => {
+      const cRadios = byController(radios as { controller_device_id: number; matched_device_id: number | null; matched_device_name: string | null }[], c.id);
+
+      // Group radios by the AP they sit on. An unmatched radio means a CAP that is
+      // not a managed device — worth showing rather than hiding, since it is often
+      // the reason an AP is missing from the fleet.
+      const groups = new Map<string, { device_id: number | null; device_name: string; radios: unknown[] }>();
+      for (const r of cRadios) {
+        const key = r.matched_device_id != null ? `d:${r.matched_device_id}` : `u:${(r as { remote_cap_name?: string }).remote_cap_name ?? 'unknown'}`;
+        const g = groups.get(key) ?? {
+          device_id: r.matched_device_id,
+          device_name: r.matched_device_name ?? (r as { remote_cap_name?: string }).remote_cap_name ?? 'Unmanaged CAP',
+          radios: [],
+        };
+        g.radios.push(r);
+        groups.set(key, g);
+      }
+
+      const ssids = (interfaces as { device_id: number }[]).filter((i) =>
+        cRadios.some((r) => r.matched_device_id === i.device_id)
+      );
+
+      // Peer counts come from the controller's own monitor output. The CAP's local
+      // registration table is empty whenever traffic is processed centrally, which
+      // is why every row previously read zero.
+      const peers = (rows: { registered_peers?: number | null }[]) =>
+        rows.reduce((n, r) => n + (r.registered_peers ?? 0), 0);
+
+      return {
+        ...c,
+        client_count: peers(cRadios as { registered_peers?: number | null }[]),
+        access_points: [...groups.values()].map((g) => ({
+          ...g,
+          client_count: peers(g.radios as { registered_peers?: number | null }[]),
+        })),
+        configurations: byController(configs as { controller_device_id: number; name: string }[], c.id)
+          .map((cfg) => ({
+            ...cfg,
+            // The rule and the configuration it applies are one idea; showing them in
+            // separate boxes made the reader join them by eye (#94).
+            rules: byController(provisioning as { controller_device_id: number; master_configuration: string | null }[], c.id)
+              .filter((p) => p.master_configuration === cfg.name),
+          })),
+        provisioning: byController(provisioning as { controller_device_id: number; master_configuration: string | null }[], c.id)
+          .filter((p) => !configs.some((cfg) => (cfg as { controller_device_id: number; name: string }).controller_device_id === c.id
+            && (cfg as { name: string }).name === p.master_configuration)),
+        ssids,
+      };
+    }),
+  });
+});
+
+// ─── Wireless interfaces (SSIDs) ──────────────────────────────────────────────
+
+// GET /api/wireless/:id/bridges — bridge list + current port memberships
+router.get('/:id/bridges', async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const collector = new DeviceCollector(ap);
+  try {
+    await collector.connect();
+    const [bridges, ports] = await Promise.all([
+      collector.getBridges(),
+      collector.getBridgePorts(),
+    ]);
+    return res.json({ bridges, ports });
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// GET /api/wireless/:id/interfaces — live from device
+router.get('/:id/interfaces', async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const collector = new DeviceCollector(ap);
+  try {
+    await collector.connect();
+    const ifaces = await collector.getWirelessInterfaces();
+    return res.json(ifaces);
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// POST /api/wireless/:id/interfaces — create new SSID/virtual AP
+router.post('/:id/interfaces', requireWrite, async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const {
+    ssid, mode = 'ap-bridge', band, frequency, channel_width,
+    tx_power, tx_power_mode, antenna_gain, country, installation,
+    security_profile, disabled = false,
+    passphrase, authentication_types,
+    bridge, vlan_id,
+    // advanced
+    master_interface,
+  } = req.body as Record<string, string | boolean | number | string[] | undefined>;
+
+  if (!ssid) {
+    return res.status(400).json({ error: '"ssid" is required' });
+  }
+
+  const collector = new DeviceCollector(ap);
+  try {
+    await collector.connect();
+
+    // A virtual AP created on a CAPsMAN-provisioned radio is discarded by the
+    // controller at the next provision, so refuse instead of reporting success.
+    const { local: localRadios, capsmanOwned } = await collector.partitionRadios();
+    if (localRadios.length === 0 && capsmanOwned.length > 0) {
+      return res.status(409).json({
+        error: `Every radio on ${ap.name} is provisioned by CAPsMAN (${capsmanOwned.join(', ')}). `
+          + `Add this SSID to the controller's configuration so it is provisioned to the access points.`,
+      });
+    }
+
+    // Auto-generate the next available interface name (e.g. wifi3, wifi4 …)
+    const autoName = await collector.getNextInterfaceName();
+
+    const params: Record<string, string> = {
+      name: autoName,
+      ssid: String(ssid),
+      mode: String(mode),
+      disabled: disabled ? 'yes' : 'no',
+    };
+    if (band)             params['band']             = String(band);
+    if (frequency)        params['frequency']        = String(frequency);
+    if (channel_width)    params['channel-width']    = String(channel_width);
+    if (tx_power)         params['tx-power']         = String(tx_power);
+    if (tx_power_mode)    params['tx-power-mode']    = String(tx_power_mode);
+    if (antenna_gain !== undefined) params['antenna-gain'] = String(antenna_gain);
+    if (country)          params['country']          = String(country);
+    if (installation)     params['installation']     = String(installation);
+    if (security_profile) params['security-profile'] = String(security_profile);
+    if (passphrase)       params['passphrase']       = String(passphrase);
+    if (authentication_types) {
+      params['authentication-types'] = Array.isArray(authentication_types)
+        ? authentication_types.join(',')
+        : String(authentication_types);
+    }
+    if (master_interface) params['master-interface'] = String(master_interface);
+
+    await collector.addWirelessInterface(params);
+    // Bridge port membership — must be done after interface exists
+    if (bridge) {
+      await collector.setInterfaceBridge(
+        autoName,
+        String(bridge),
+        vlan_id ? Number(vlan_id) : undefined,
+      );
+      // Ensure the VLAN ID is also in the bridge VLAN table (untagged)
+      if (vlan_id) {
+        await collector.ensureVlanMembership(autoName, Number(vlan_id));
+      }
+    }
+    // Refresh cache
+    await collector.collectWirelessInterfaces();
+    return res.status(201).json({ ok: true, name: autoName });
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// PUT /api/wireless/:id/interfaces/:name — update SSID/radio config
+router.put('/:id/interfaces/:name', requireWrite, async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const ifaceName = req.params.name;
+  const body = req.body as Record<string, string | boolean | number | undefined>;
+
+  const params: Record<string, string> = {};
+  const map: Record<string, string> = {
+    ssid: 'ssid', mode: 'mode', band: 'band', frequency: 'frequency',
+    channel_width: 'channel-width', tx_power: 'tx-power',
+    tx_power_mode: 'tx-power-mode', antenna_gain: 'antenna-gain',
+    country: 'country', installation: 'installation',
+    security_profile: 'security-profile', master_interface: 'master-interface',
+    passphrase: 'passphrase',
+  };
+
+  for (const [key, rosKey] of Object.entries(map)) {
+    if (body[key] !== undefined) params[rosKey] = String(body[key]);
+  }
+  if (body.disabled !== undefined) params['disabled'] = body.disabled ? 'yes' : 'no';
+  if (body.authentication_types !== undefined) {
+    params['authentication-types'] = Array.isArray(body.authentication_types)
+      ? (body.authentication_types as string[]).join(',')
+      : String(body.authentication_types);
+  }
+
+  // Guarded (outside review P2-8): an AP managed over its own wireless link is
+  // cut off by a change to that interface, so it is flagged when it's on the
+  // management path, and undone automatically either way.
+  await withGuardedChange(ap.id, req, res,
+    {
+      kind: 'wireless.interface.set',
+      summary: `Change wireless interface ${ifaceName}`,
+      change: {
+        kind: 'batch',
+        changes: [
+          ...(body.disabled !== undefined ? [{ kind: 'interface.disable' as const, name: ifaceName, disabled: !!body.disabled }] : []),
+          { kind: 'path-object.change', name: ifaceName, what: 'Changing this wireless interface' },
+        ],
+      },
+    },
+    async (collector) => {
+      await collector.assertNotCapsmanManaged(ifaceName);
+      await collector.setWirelessInterface(ifaceName, params);
+      // Bridge port membership — only touched when 'bridge' key is present in the request
+      if (body.bridge !== undefined) {
+        const bridgeName = body.bridge ? String(body.bridge) : null;
+        const pvid = body.vlan_id ? Number(body.vlan_id) : undefined;
+        await collector.setInterfaceBridge(ifaceName, bridgeName, pvid);
+        // Ensure the VLAN ID is in the bridge VLAN table (untagged)
+        if (bridgeName && body.vlan_id) {
+          await collector.ensureVlanMembership(ifaceName, Number(body.vlan_id));
+        }
+      }
+      return { ok: true };
+    },
+    async (c) => { await c.collectWirelessInterfaces(); });
+});
+
+// DELETE /api/wireless/:id/interfaces/:name
+router.delete('/:id/interfaces/:name', requireWrite, async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const ifaceName = req.params.name;
+  await withGuardedChange(ap.id, req, res,
+    {
+      kind: 'wireless.interface.remove',
+      summary: `Delete wireless interface ${ifaceName}`,
+      // For reachability, a deleted interface is a disabled one.
+      change: { kind: 'interface.disable', name: ifaceName, disabled: true },
+    },
+    async (collector) => {
+      await collector.assertNotCapsmanManaged(ifaceName);
+      await collector.removeWirelessInterface(ifaceName);
+      return { ok: true };
+    },
+    // Only forget it locally once the device is confirmed to have kept the change.
+    async () => { await query(`DELETE FROM wireless_interfaces WHERE device_id=$1 AND name=$2`, [ap.id, ifaceName]); });
+});
+
+// ─── Security Profiles ────────────────────────────────────────────────────────
+
+// GET /api/wireless/:id/security-profiles — live from device
+router.get('/:id/security-profiles', async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const collector = new DeviceCollector(ap);
+  try {
+    await collector.connect();
+    const profiles = await collector.getSecurityProfilesLive();
+    return res.json(profiles);
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// POST /api/wireless/:id/security-profiles
+router.post('/:id/security-profiles', requireWrite, async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const {
+    name, mode = 'dynamic-keys',
+    authentication_types, passphrase,
+    unicast_ciphers, group_ciphers, management_protection = 'disabled',
+    management_protection_key,
+  } = req.body as Record<string, string | string[] | undefined>;
+
+  if (!name) return res.status(400).json({ error: '"name" is required' });
+
+  const params: Record<string, string> = {
+    name: String(name),
+    mode: String(mode),
+    'management-protection': String(management_protection),
+  };
+
+  if (authentication_types) {
+    params['authentication-types'] = Array.isArray(authentication_types)
+      ? authentication_types.join(',')
+      : String(authentication_types);
+  }
+  if (unicast_ciphers) {
+    params['unicast-ciphers'] = Array.isArray(unicast_ciphers)
+      ? unicast_ciphers.join(',')
+      : String(unicast_ciphers);
+  }
+  if (group_ciphers) {
+    params['group-ciphers'] = Array.isArray(group_ciphers)
+      ? group_ciphers.join(',')
+      : String(group_ciphers);
+  }
+  if (passphrase)               params['passphrase']               = String(passphrase);
+  if (management_protection_key) params['management-protection-key'] = String(management_protection_key);
+
+  const collector = new DeviceCollector(ap);
+  try {
+    await collector.connect();
+    await collector.addSecurityProfile(params);
+    await collector.collectSecurityProfiles();
+    return res.status(201).json({ ok: true });
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// PUT /api/wireless/:id/security-profiles/:name
+router.put('/:id/security-profiles/:name', requireWrite, async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const profileName = req.params.name;
+  const body = req.body as Record<string, string | string[] | undefined>;
+
+  const params: Record<string, string> = {};
+  if (body.mode)                      params['mode']                      = String(body.mode);
+  if (body.management_protection)     params['management-protection']     = String(body.management_protection);
+  if (body.management_protection_key) params['management-protection-key'] = String(body.management_protection_key);
+  if (body.passphrase)                params['passphrase']                = String(body.passphrase);
+
+  if (body.authentication_types !== undefined) {
+    params['authentication-types'] = Array.isArray(body.authentication_types)
+      ? body.authentication_types.join(',')
+      : String(body.authentication_types);
+  }
+  if (body.unicast_ciphers !== undefined) {
+    params['unicast-ciphers'] = Array.isArray(body.unicast_ciphers)
+      ? body.unicast_ciphers.join(',')
+      : String(body.unicast_ciphers);
+  }
+  if (body.group_ciphers !== undefined) {
+    params['group-ciphers'] = Array.isArray(body.group_ciphers)
+      ? body.group_ciphers.join(',')
+      : String(body.group_ciphers);
+  }
+
+  // Guarded: a profile change reaches every interface using it, including a
+  // wireless uplink the AP is managed through.
+  await withGuardedChange(ap.id, req, res,
+    { kind: 'wireless.security-profile.set', summary: `Change security profile ${profileName}` },
+    async (collector) => { await collector.setSecurityProfile(profileName, params); return { ok: true }; },
+    async (c) => { await c.collectSecurityProfiles(); });
+});
+
+// DELETE /api/wireless/:id/security-profiles/:name
+router.delete('/:id/security-profiles/:name', requireWrite, async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const profileName = req.params.name;
+  await withGuardedChange(ap.id, req, res,
+    { kind: 'wireless.security-profile.remove', summary: `Delete security profile ${profileName}` },
+    async (collector) => { await collector.removeSecurityProfile(profileName); return { ok: true }; },
+    async () => { await query(`DELETE FROM wireless_security_profiles WHERE device_id=$1 AND name=$2`, [ap.id, profileName]); });
+});
+
+// ─── Radio monitoring / diagnostics ──────────────────────────────────────────
+
+// GET /api/wireless/:id/radios — hardware radio capabilities (wifi package only)
+router.get('/:id/radios', async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const collector = new DeviceCollector(ap);
+  try {
+    await collector.connect();
+    const radios = await collector.getWifiRadioInfo();
+    return res.json(radios);
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// GET /api/wireless/:id/registration-table — connected wireless clients
+router.get('/:id/registration-table', async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const collector = new DeviceCollector(ap);
+  try {
+    await collector.connect();
+    const table = await collector.getWirelessRegistrationTable();
+    return res.json(table);
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// GET /api/wireless/:id/monitor/:iface — real-time radio monitor snapshot
+router.get('/:id/monitor/:iface', async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const collector = new DeviceCollector(ap);
+  try {
+    await collector.connect();
+    const data = await collector.getWirelessMonitor(req.params.iface);
+    return res.json(data[0] ?? {});
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// POST /api/wireless/:id/scan/:iface — scan for nearby APs (5 s)
+// POST, not GET: a scan takes the radio off-channel, so it must not be
+// something a crafted link or a page load can trigger (outside review U13).
+router.post('/:id/scan/:iface', requireWrite, async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const collector = new DeviceCollector(ap);
+  try {
+    await collector.connect();
+    const results = await collector.scanWireless(req.params.iface);
+    return res.json(results);
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// Aggregate raw RouterOS spectral-scan rows (35 k+ per 10 s scan) into one point
+// per unique frequency. Each row has: freq (MHz, string), magn (dBm, string),
+// peak (dBm, string). We average magn and keep the highest peak per frequency.
+function aggregateSpectralRows(
+  rows: Record<string, string>[]
+): { freq: number; magn: number; peak: number }[] {
+  const map = new Map<number, { sum: number; count: number; peak: number }>();
+  for (const row of rows) {
+    const freq = parseFloat(row['freq'] || '0');
+    const magn = parseInt(row['magn'] || '-120', 10);
+    const peak = parseInt(row['peak'] || magn.toString(), 10);
+    if (freq <= 0) continue;
+    const existing = map.get(freq);
+    if (existing) {
+      existing.sum   += magn;
+      existing.count += 1;
+      existing.peak   = Math.max(existing.peak, peak);
+    } else {
+      map.set(freq, { sum: magn, count: 1, peak });
+    }
+  }
+  return Array.from(map.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([freq, { sum, count, peak }]) => ({
+      freq,
+      magn: Math.round(sum / count),
+      peak,
+    }));
+}
+
+// POST /api/wireless/:id/spectral-scan/:iface — run an on-demand spectral scan,
+// save the aggregated result and return it immediately.
+router.post('/:id/spectral-scan/:iface', requireWrite, async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  const collector = new DeviceCollector(ap);
+  try {
+    await collector.connect();
+    const rows = await collector.collectSpectralScan(req.params.iface);
+    if (rows.length === 0) {
+      return res.status(422).json({ error: 'No spectral data returned — interface may not support spectral scan' });
+    }
+    const aggregated = aggregateSpectralRows(rows);
+    const saved = await query<{ id: number; scanned_at: string }>(
+      `INSERT INTO spectral_scan_data (device_id, interface_name, data, scan_type)
+       VALUES ($1, $2, $3, 'manual')
+       RETURNING id, scanned_at`,
+      [ap.id, req.params.iface, JSON.stringify(aggregated)]
+    );
+    return res.json({ id: saved[0].id, scanned_at: saved[0].scanned_at, data: aggregated });
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// GET /api/wireless/:id/spectral-history/:iface?limit=5 — return last N scans from DB
+router.get('/:id/spectral-history/:iface', async (req: Request, res: Response) => {
+  const deviceId = parseInt(req.params.id);
+  const iface = req.params.iface;
+  const limit = Math.min(parseInt(String(req.query.limit || '5'), 10), 20);
+
+  const scans = await query<{ id: number; scanned_at: string; scan_type: string; data: unknown }>(
+    `SELECT id, scanned_at, scan_type, data
+     FROM spectral_scan_data
+     WHERE device_id = $1 AND interface_name = $2
+     ORDER BY scanned_at DESC
+     LIMIT $3`,
+    [deviceId, iface, limit]
+  );
+  return res.json(scans);
+});
+
+// ─── AP scan ──────────────────────────────────────────────────────────────────
+
+interface APBandEntry {
+  bssid: string; vendor: string; signal: number;
+  freq: number; band: string; channel_width: string;
+}
+interface APNetworkEntry {
+  ssid: string; security: string; hidden: boolean; entries: APBandEntry[];
+}
+
+function normBand(band: string, freq: number): string {
+  if (band.includes('6ghz') || freq >= 5925) return '6 GHz';
+  if (band.includes('5ghz') || (freq >= 4900 && freq < 5925)) return '5 GHz';
+  return '2.4 GHz';
+}
+
+function aggregateAPScanRows(
+  allRows: { iface: string; rows: Record<string, string>[] }[]
+): APNetworkEntry[] {
+  const byKey = new Map<string, APNetworkEntry>();
+
+  for (const { rows } of allRows) {
+    for (const row of rows) {
+      const ssid   = row['network-name'] || row['ssid'] || '';
+      const bssid  = (row['address'] || row['bssid'] || '').toLowerCase();
+      if (!bssid) continue;
+      const rawSig = row['signal-strength'] || row['signal'] || '-100';
+      const signal = parseInt(rawSig, 10) || -100;
+      const freq   = parseFloat(row['frequency'] || row['channel'] || '0');
+      const band   = normBand(row['band'] || row['radio-band'] || '', freq);
+      // security: prefer explicit field; if auth-types present but no explicit security, call it WPA
+      const security = row['security']
+        || (row['authentication-types'] ? 'WPA' : 'open');
+      const channelWidth = row['channel-width'] || '';
+      const key = ssid || `hidden:${bssid}`;
+
+      if (!byKey.has(key)) {
+        byKey.set(key, { ssid, security, hidden: !ssid, entries: [] });
+      }
+      const net = byKey.get(key)!;
+      const existing = net.entries.find(e => e.bssid === bssid && e.freq === freq);
+      if (existing) {
+        if (signal > existing.signal) existing.signal = signal;
+      } else {
+        net.entries.push({
+          bssid,
+          vendor: lookupVendor(bssid),
+          signal,
+          freq,
+          band,
+          channel_width: channelWidth,
+        });
+      }
+    }
+  }
+
+  return Array.from(byKey.values()).sort((a, b) => {
+    const aBest = Math.max(...a.entries.map(e => e.signal));
+    const bBest = Math.max(...b.entries.map(e => e.signal));
+    return bBest - aBest;
+  });
+}
+
+// POST /api/wireless/:id/ap-scan — scan all interfaces, combine results, save + return
+router.post('/:id/ap-scan', requireWrite, async (req: Request, res: Response) => {
+  const ap = await getAP(parseInt(req.params.id));
+  if (!ap) return res.status(404).json({ error: 'Wireless AP not found' });
+
+  // Only scan physical radios (master=true). Virtual APs (master=false, e.g. extra SSIDs)
+  // share a radio with their master interface and cannot initiate scans independently.
+  const ifaces = await query<{ name: string }>(
+    `SELECT name FROM wireless_interfaces
+     WHERE device_id = $1
+       AND disabled = FALSE
+       AND (config_json->>'master' IS NULL OR config_json->>'master' != 'false')`,
+    [ap.id]
+  );
+  if (ifaces.length === 0) {
+    return res.status(422).json({ error: 'No active wireless interfaces found' });
+  }
+
+  // Use a separate TCP connection per radio — a 10 s streaming scan can leave
+  // residual bytes in the socket that corrupt a subsequent scan on the same connection.
+  const allRows: { iface: string; rows: Record<string, string>[] }[] = [];
+  for (const iface of ifaces) {
+    const collector = new DeviceCollector(ap);
+    try {
+      await collector.connect();
+      const rows = await collector.scanWireless(iface.name, 10_000);
+      if (rows.length > 0) allRows.push({ iface: iface.name, rows });
+    } catch {
+      // ignore per-interface errors; continue to next radio
+    } finally {
+      collector.disconnect();
+    }
+  }
+
+  if (allRows.length === 0) {
+    return res.status(422).json({ error: 'No AP scan data returned' });
+  }
+
+  try {
+    const aggregated = aggregateAPScanRows(allRows);
+    const saved = await query<{ id: number; scanned_at: string }>(
+      `INSERT INTO ap_scan_data (device_id, data, scan_type)
+       VALUES ($1, $2, 'manual') RETURNING id, scanned_at`,
+      [ap.id, JSON.stringify(aggregated)]
+    );
+    return res.json({ id: saved[0].id, scanned_at: saved[0].scanned_at, data: aggregated });
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  }
+});
+
+// GET /api/wireless/:id/ap-scan-history?limit=5 — last N saved scans
+router.get('/:id/ap-scan-history', async (req: Request, res: Response) => {
+  const deviceId = parseInt(req.params.id);
+  const limit = Math.min(parseInt(String(req.query.limit || '5'), 10), 20);
+
+  const scans = await query<{ id: number; scanned_at: string; scan_type: string; data: unknown }>(
+    `SELECT id, scanned_at, scan_type, data
+     FROM ap_scan_data
+     WHERE device_id = $1
+     ORDER BY scanned_at DESC
+     LIMIT $2`,
+    [deviceId, limit]
+  );
+  return res.json(scans);
+});
+
+// ─── RF Health (channel map, RSSI density, TX retries, connectivity) ──────────
+
+// Optional ?deviceId= scopes any of the RF endpoints to a single AP.
+function deviceScope(req: Request): number | null {
+  const raw = req.query.deviceId;
+  if (raw === undefined || raw === '') return null;
+  const id = parseInt(String(raw), 10);
+  return Number.isFinite(id) ? id : null;
+}
+
+/**
+ * GET /api/wireless/rf/channels — radios with their actual spectrum occupancy.
+ *
+ * Returns the interference analysis rather than raw channel numbers. Overlap is a
+ * property of megahertz, not of channel indices, and getting it wrong gives
+ * actively bad planning advice — so the model is computed and tested server-side
+ * (see utils/rfSpectrum.ts) instead of being re-derived in the browser.
+ *
+ * Radios also carry the CAPsMAN controller that provisions them, because channel
+ * planning is per physical location: two APs on channel 6 in different buildings
+ * are not a conflict (issue #97).
+ */
+router.get('/rf/channels', async (req: Request, res: Response) => {
+  const deviceId = deviceScope(req);
+  const siteFilter = siteScopeByDevice(activeSite(req), 'wi.device_id');
+
+  // Two sources, because a CAPsMAN-managed AP stores no frequency of its own — the
+  // controller owns the channel. Reading only wireless_interfaces silently dropped
+  // every managed radio, which left them out of the analysis entirely and pushed
+  // whatever remained into "standalone" (issue #97).
+  const rows = await query<{
+    device_id: number; device_name: string; name: string; ssid: string | null;
+    frequency: number | null; channel_width: string | null;
+    registered_clients: number | null;
+    controller_device_id: number | null; controller_name: string | null;
+    capsman_channel: string | null; capsman_peers: number | null;
+  }>(`
+    SELECT wi.device_id, d.name AS device_name, wi.name, wi.ssid,
+           wi.frequency, wi.channel_width, wi.registered_clients,
+           cr.controller_device_id,
+           cd.name           AS controller_name,
+           cr.current_channel AS capsman_channel,
+           cr.registered_peers AS capsman_peers
+    FROM wireless_interfaces wi
+    JOIN devices d ON d.id = wi.device_id
+    LEFT JOIN capsman_radios cr ON cr.matched_device_id = wi.device_id
+                               AND cr.radio_mac = wi.radio_mac
+    LEFT JOIN devices cd ON cd.id = cr.controller_device_id
+    WHERE ${wirelessDeviceSql('d')}
+      AND wi.disabled = FALSE
+      AND (wi.config_json->>'master-interface') IS NULL
+      AND (
+        (wi.frequency IS NOT NULL AND wi.frequency > 0)
+        OR cr.current_channel IS NOT NULL
+      )
+      ${deviceId ? 'AND wi.device_id = $1' : ''}
+      ${siteFilter ? `AND ${siteFilter}` : ''}
+    ORDER BY d.name ASC, wi.name ASC
+  `, deviceId ? [deviceId] : []);
+
+  // Resolve each radio's operating channel, preferring what the controller reports.
+  const resolved = rows.map((r) => {
+    const fromController = parseChannelSpec(r.capsman_channel);
+    const frequency = fromController?.frequency ?? r.frequency ?? 0;
+    const channel_width = fromController ? `${fromController.widthMhz}mhz` : r.channel_width;
+    return {
+      ...r,
+      frequency,
+      channel_width,
+      registered_clients: r.capsman_peers ?? r.registered_clients ?? 0,
+    };
+  }).filter((r) => r.frequency > 0);
+
+  // Interference is only meaningful between radios that can hear each other, so
+  // the analysis runs per location: each controller separately, and everything
+  // unmanaged as one group.
+  const groups = new Map<string, typeof resolved>();
+  for (const r of resolved) {
+    const key = r.controller_device_id != null ? `c:${r.controller_device_id}` : 'standalone';
+    groups.set(key, [...(groups.get(key) ?? []), r]);
+  }
+
+  const analyzed: Record<string, unknown>[] = [];
+  for (const group of groups.values()) {
+    const verdicts = analyzeSpectrum(group);
+    group.forEach((r, i) => {
+      const v = verdicts[i];
+      analyzed.push({
+        ...r,
+        low_mhz: v.spectrum.lowMhz,
+        high_mhz: v.spectrum.highMhz,
+        width_mhz: v.spectrum.widthMhz,
+        channel: v.spectrum.channel,
+        overlap: v.kind,
+        clashes: v.clashes.map((c) => ({
+          kind: c.kind,
+          overlap_mhz: c.overlapMhz,
+          device_name: group[c.with]?.device_name ?? null,
+          interface_name: group[c.with]?.name ?? null,
+          channel: analyzeSpectrum([group[c.with]])[0].spectrum.channel,
+        })),
+      });
+    });
+  }
+
+  const locations = [...groups.entries()].map(([key, group]) => ({
+    key,
+    name: group[0]?.controller_name ?? 'Standalone access points',
+    controller_device_id: group[0]?.controller_device_id ?? null,
+    radios: group.length,
+    summary: summarize(analyzeSpectrum(group)),
+  }));
+
+  res.json({ radios: analyzed, locations, bands: BAND_RANGES });
+});
+
+// GET /api/wireless/rf/signals — active wireless clients' RSSI (for density view)
+router.get('/rf/signals', async (req: Request, res: Response) => {
+  const deviceId = deviceScope(req);
+  const siteFilter = siteScopeByDevice(activeSite(req), 'c.device_id');
+  const rows = await query(`
+    SELECT c.mac_address, c.signal_strength, c.device_id, d.name AS device_name,
+           c.custom_name, c.hostname
+    FROM clients c
+    JOIN devices d ON d.id = c.device_id
+    WHERE c.active = TRUE
+      AND c.client_type = 'wireless'
+      AND c.signal_strength IS NOT NULL
+      AND c.signal_strength < 0
+      ${deviceId ? 'AND c.device_id = $1' : ''}
+      ${siteFilter ? `AND ${siteFilter}` : ''}
+    ORDER BY c.signal_strength DESC
+  `, deviceId ? [deviceId] : []);
+  res.json(rows);
+});
+
+/**
+ * GET /api/wireless/rf/capabilities — what the fleet's wireless hardware can report.
+ *
+ * TX-retry figures are derived from per-client CCQ, which only the legacy `wireless`
+ * driver exposes. On an all-RouterOS-7 fleet that panel can never have data, so the
+ * UI needs to know rather than rendering an empty box forever (issue #96).
+ */
+router.get('/rf/capabilities', async (req: Request, res: Response) => {
+  const siteFilter = siteScopeDevices(activeSite(req));
+  const rows = await query<{ wifi_package: string | null; n: string }>(`
+    SELECT wifi_package, COUNT(*) AS n
+    FROM devices
+    WHERE wifi_package IS NOT NULL AND wifi_package <> 'none'
+      ${siteFilter ? `AND ${siteFilter}` : ''}
+    GROUP BY wifi_package`);
+
+  const counts = Object.fromEntries(rows.map((r) => [r.wifi_package ?? 'unknown', Number(r.n)]));
+  const legacy = counts['wireless'] ?? 0;
+  res.json({
+    packages: counts,
+    legacyRadios: legacy,
+    // Unknown means nothing has been polled yet; show the panel rather than
+    // hiding something that may well populate a minute later.
+    txRetriesAvailable: legacy > 0 || rows.length === 0,
+  });
+});
+
+// GET /api/wireless/rf/tx-quality?range=6h — latest per-radio TX retry % (from CCQ)
+router.get('/rf/tx-quality', async (req: Request, res: Response) => {
+  const deviceId = deviceScope(req);
+  const ranges: Record<string, string> = { '1h': '1h', '3h': '3h', '6h': '6h', '12h': '12h', '24h': '24h' };
+  const fluxRange = ranges[String(req.query.range || '6h')] || '6h';
+
+  const { getQueryApi } = await import('../config/influxdb');
+  const queryApi = getQueryApi();
+  const bucket = process.env.INFLUXDB_BUCKET || 'mikrotik';
+  const deviceFilter = deviceId ? `|> filter(fn: (r) => r["device_id"] == ${fluxString(String(deviceId))})` : '';
+
+  const flux = `
+    from(bucket: "${bucket}")
+      |> range(start: -${fluxRange})
+      |> filter(fn: (r) => r["_measurement"] == "wireless_radio_quality")
+      |> filter(fn: (r) => r["_field"] == "tx_retry_pct")
+      ${deviceFilter}
+      |> group(columns: ["device_id", "device_name", "interface", "band"])
+      |> last()
+  `;
+
+  try {
+    const rows: { device_id: string; device_name?: string; interface: string; band: string; tx_retry_pct: number }[] = [];
+    await new Promise<void>((resolve, reject) => {
+      queryApi.queryRows(flux, {
+        next(row, tableMeta) {
+          const obj = tableMeta.toObject(row) as Record<string, unknown>;
+          rows.push({
+            device_id: String(obj['device_id'] || ''),
+            device_name: obj['device_name'] ? String(obj['device_name']) : undefined,
+            interface: String(obj['interface'] || ''),
+            band: String(obj['band'] || 'unknown'),
+            tx_retry_pct: obj['_value'] != null ? Number(obj['_value']) : 0,
+          });
+        },
+        error: reject,
+        complete: resolve,
+      });
+    });
+    return res.json(rows);
+  } catch (err) {
+    console.error('TX-quality InfluxDB error:', err);
+    return res.json([]);
+  }
+});
+
+// The log-derived "WiFi Connectivity Success" funnel was removed (#156): it
+// counted ordinary disconnects as failures. DHCP pool usage replaced it (see
+// /api/network-services/dhcp/pool-usage).
+
+// ─── Rogue / neighbor AP detection ────────────────────────────────────────────
+
+// GET /api/wireless/rf/rogue — classify latest AP scans against our own SSIDs/BSSIDs
+router.get('/rf/rogue', async (req: Request, res: Response) => {
+  // Our hardware is matched fleet-wide, our SSIDs per site (J7).
+  const { classifyLatestScans } = await import('../services/rogueScan');
+  const { rogues, neighbors, scans } = await classifyLatestScans(activeSite(req));
+  res.json({
+    rogues, neighbors,
+    lastScanAt: scans.length ? scans.map(s => String(s.scanned_at)).sort().pop() : null,
+    scannedDevices: scans.length,
+  });
+});
+
+export default router;

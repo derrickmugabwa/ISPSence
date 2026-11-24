@@ -1,0 +1,82 @@
+// Called by the foundation check inside its disposable schema. The HTTP
+// harness uses a fictional administrator and is never exposed outside its container.
+const assert=require('node:assert/strict');
+const {randomUUID}=require('node:crypto');
+module.exports=async function checkFunding(pool,serviceId){
+  await pool.query(require('/app/dist/modules/billing/portals').PORTALS_SCHEMA);
+  await pool.query(require('/app/dist/modules/billing/payheroSchema').PAYHERO_SCHEMA);
+  const express=require('express'); require('express-async-errors');
+  require('/app/dist/middleware/auth').requireAuth=(req,_res,next)=>{req.user={userId:1,username:'funding-fixture',role:'admin'};next();};
+  const app=express();app.use(express.json());
+  for(const [path,file] of [['packages','billingPackages'],['payments','billingPayments'],['customers','billingCustomers'],['subscriptions','billingSubscriptions']]) app.use('/'+path,require('/app/dist/routes/'+file).default);
+  app.use((e,_req,res,_next)=>res.status(e.status||500).json({error:e.message}));
+  const server=app.listen(0,'127.0.0.1'); await new Promise(resolve=>server.once('listening',resolve));
+  const url='http://127.0.0.1:'+server.address().port;
+  const api=async(path,body,method=body?'POST':'GET')=>{const r=await fetch(url+path,{method,headers:{'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});return {status:r.status,body:await r.json()};};
+  const ok=(r,status=200)=>{assert.equal(r.status,status,JSON.stringify(r.body));return r.body;};
+  try{
+    const spec={name:'PPPoE offer',amount_minor:200000,currency:'KES',duration_value:1,duration_unit:'calendar_month',download_bps:10000000,upload_bps:5000000,allowance_bytes:null,enabled:true,service_types:['pppoe']};
+    const offer=ok(await api('/packages',spec),201);
+    const both=ok(await api('/packages',{...spec,name:'Shared offer',service_types:['hotspot','pppoe']}),201);
+    const omitted=ok(await api('/packages/'+offer.id,{...spec,service_types:undefined,version:offer.version},'PUT'));
+    assert.deepEqual(omitted.service_types,['pppoe']);
+    const body={customer_id:1,service_id:serviceId,package_id:offer.id,package_version:omitted.version,payer_phone:'0712345678',request_key:randomUUID()};
+    assert.equal((await api('/payments',{...body,service_id:undefined})).status,409);
+    assert.equal((await api('/payments',{...body,customer_id:2})).status,409);
+    assert.equal((await api('/payments',{...body,package_id:1,package_version:1})).status,409);
+    const payment=ok(await api('/payments',body),201);
+    assert.equal(payment.service_id,serviceId);assert.equal(payment.package_snapshot.service_type,'pppoe');
+    assert.equal(ok(await api('/payments',body)).id,payment.id);
+    assert.equal((await api('/payments',{...body,service_id:undefined})).status,409);
+    assert.equal((await api('/subscriptions',{purchase_id:payment.id,mode:'live'})).status,409);
+    const receipt={method:'cash',reference:'',paid_at:new Date().toISOString(),notes:'Fictional received funds',confirm_received:true,request_key:randomUUID()};
+    const settle=async(p)=>ok(await api('/payments/'+p.id+'/manual-receipt',{...receipt,request_key:randomUUID()}));
+    const results=await Promise.all(Array.from({length:4},()=>api('/payments/'+payment.id+'/manual-receipt',receipt)));
+    assert.ok(results.every(r=>r.status===200),JSON.stringify(results));
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM billing_payment_receipts WHERE purchase_id=$1',[payment.id])).rows[0].n,1);
+    ok(await api('/subscriptions',{purchase_id:payment.id,mode:'live'}));
+    const next=ok(await api('/payments',{...body,request_key:randomUUID()}),201);
+    const frozen=next.package_snapshot;
+    ok(await api('/packages/'+offer.id,{...spec,service_types:['hotspot'],amount_minor:300000,version:omitted.version},'PUT'));
+    await settle(next); // Honours the purchased terms even after eligibility/price changes.
+    assert.deepEqual((await pool.query('SELECT package_snapshot FROM billing_purchases WHERE id=$1',[next.id])).rows[0].package_snapshot,frozen);
+    const {grantComplimentary,parseGrant}=require('/app/dist/modules/billing/customerAccess');
+    const grantInput={service_id:serviceId,package_id:both.id,package_version:both.version,mode:'live',reason:'Fictional PPPoE grant',request_key:randomUUID(),confirm_complimentary:true};
+    const purchaseCount=(await pool.query('SELECT count(*)::int AS n FROM billing_purchases')).rows[0].n;
+    const grants=await Promise.all(Array.from({length:3},()=>grantComplimentary(parseGrant(grantInput,1),'fixture')));
+    assert.equal(new Set(grants.map(g=>g.id)).size,1);
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM billing_purchases')).rows[0].n,purchaseCount);
+    assert.equal((await api('/customers/1/complimentary-access',{...grantInput,request_key:randomUUID(),mode:'simulation',confirm_simulation:true})).status,409);
+    assert.equal((await api('/customers/2/complimentary-access',{...grantInput,request_key:randomUUID()})).status,409);
+    const linked=(await pool.query(`SELECT x.*,s.activation_at,s.status FROM billing_service_periods x JOIN billing_subscriptions s ON s.id=x.subscription_id WHERE x.service_id=$1 ORDER BY x.queue_sequence`,[serviceId])).rows;
+    assert.equal(linked.length,3);assert.ok(linked.every(r=>r.activation_at===null&&r.status==='pending_activation'));
+    assert.ok(linked.every((r,i)=>i===0||BigInt(r.queue_sequence)>BigInt(linked[i-1].queue_sequence)));
+    const summaries=await require('/app/dist/modules/billing/subscriptions').subscriptionList(1);
+    const originalService=(await pool.query('SELECT username FROM billing_customer_services WHERE id=$1',[serviceId])).rows[0];
+    assert.ok(summaries.filter(s=>s.service_id===serviceId).every(s=>s.username===originalService.username));
+    assert.equal((await pool.query('SELECT revision FROM billing_service_credentials WHERE service_id=$1',[serviceId])).rows[0].revision,2);
+    const request={...body,request_key:randomUUID(),package_id:both.id,package_version:both.version};
+    const another=ok(await api('/payments',request),201);
+    const {createServiceDraft}=require('/app/dist/modules/billing/customerServices');
+    const otherService=(await createServiceDraft({customer_id:1,username:null,label:'Second connection',reason:'Fixture',request_key:randomUUID()},'fixture')).service;
+    assert.equal((await api('/payments',{...request,service_id:otherService.id})).status,409);
+    await assert.rejects(pool.query('UPDATE billing_purchases SET service_id=$1 WHERE id=$2',[otherService.id,another.id]),e=>e.code==='23514');
+    const {billingDashboard,dashboardInput}=require('/app/dist/modules/billing/billingDashboard');
+    const day=new Date().toISOString().slice(0,10);
+    const report=await billingDashboard(dashboardInput({start:day,end:day,view:'customers',mode:'live'}));
+    assert.equal(report.rows.find(r=>r.id===1).username,originalService.username);
+    const {createPortal,publishPortal,publicPortal,portalTemplates}=require('/app/dist/modules/billing/portals');
+    const config={...portalTemplates[0].default_config,package_ids:[both.id]};
+    const portal=await createPortal({name:'Fixture portal',slug:'funding-fixture',config},'fixture');
+    await publishPortal(portal.id,portal.version,true,'fixture');
+    assert.equal((await publicPortal('funding-fixture')).packages.length,1);
+    ok(await api('/packages/'+both.id,{...spec,name:'Shared offer',service_types:['pppoe'],version:both.version},'PUT'));
+    assert.equal((await publicPortal('funding-fixture')).packages.length,0);
+    await assert.rejects(createPortal({name:'Rejected',slug:'rejected-fixture',config},'fixture'),e=>e.status===409);
+    const migration=await pool.connect();try{await require('/app/dist/modules/billing/customerServicesSchema').migrateCustomerServices(migration);}finally{migration.release();}
+    assert.equal((await pool.query('SELECT count(*)::int AS n FROM billing_service_periods WHERE service_id=$1',[serviceId])).rows[0].n,3);
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM billing_customer_services cs JOIN billing_access_accounts a ON a.id=cs.legacy_account_id JOIN billing_subscriptions s ON s.id=a.subscription_id LEFT JOIN billing_purchases p ON p.id=s.purchase_id LEFT JOIN billing_access_grants g ON g.id=s.grant_id WHERE coalesce(p.service_id,g.service_id) IS NOT NULL`)).rows[0].n,0);
+    console.log('PASS: PPPoE package eligibility, direct-request rejection, immutable service funding, receipt/grant replay, ordered prepared renewals, stable credentials and live gates');
+    console.log('PASS: eligibility changes preserve purchased terms; PPPoE offers excluded from public portals and portal publication; repeat migration preserves PPPoE mappings');
+  }finally{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+};

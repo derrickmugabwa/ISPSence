@@ -1,0 +1,22 @@
+jest.mock('../../config/database');
+jest.mock('../../middleware/auth',() => ({ ...jest.requireActual('../../middleware/auth'),requireAuth: (req: { user?: unknown },res: { status: (v: number) => { json: (v: unknown) => void } },next: () => void) => req.user ? next() : res.status(401).json({ error: 'Sign in' }) }));
+import express from 'express';
+import request from 'supertest';
+import router from '../billingDashboard';
+import payments from '../billingPayments';
+import { dashboardInput } from '../../modules/billing/billingDashboard';
+import { manualReceiptInput } from '../../modules/billing/paymentReceipts';
+import { query,transaction } from '../../config/database';
+const dates = { start: '2025-01-01',end: '2025-01-31' };
+beforeEach(() => jest.resetAllMocks());
+test.each([undefined,'viewer','operator','scoped'])('financial dashboard and manual receipts reject %s',async (role) => {
+  const app = express(); app.use(express.json()); app.use((req,_res,next) => { if (role) req.user = { userId: 1,username: 'fixture',role: role === 'scoped' ? 'admin' : role,...(role === 'scoped' ? { siteRoles: { 1: 'admin' } } : {}) }; next(); }); app.use('/dashboard',router); app.use('/payments',payments);
+  expect((await request(app).get('/dashboard').query(dates)).status).toBe(role ? 403 : 401);
+  expect((await request(app).post('/payments/x/manual-receipt').send({})).status).toBe(role ? 403 : 401);
+  expect(query).not.toHaveBeenCalled(); expect(transaction).not.toHaveBeenCalled();
+});
+test.each([{ start: '2025-02-30' },{ start: 'invalid' },{ end: '2024-01-01' },{ end: '2026-12-01' },{ offset: -1 },{ package_id: '1; DROP TABLE billing_customers' },{ method: 'card' },{ q: 'x'.repeat(101) }])('invalid dashboard filters are rejected %#',(change) => expect(() => dashboardInput({ ...dates,...change })).toThrow());
+test('reporting uses one database scope regardless of legacy environment parameters',() => expect(dashboardInput({ ...dates,mode: 'test',view: 'transactions',offset: '25' })).toMatchObject({ offset: 25,mode: 'records',view: 'transactions' }));
+const receipt = { request_key: '00000000-0000-4000-8000-000000000001',method: 'cash',reference: '',paid_at: '2025-01-01T09:00:00+03:00',notes: 'Cash verified',confirm_received: true };
+test.each([{ method: 'payhero' },{ method: 'bank_transfer' },{ notes: '' },{ confirm_received: false },{ paid_at: 'invalid' },{ amount_minor: 1 },{ request_key: 'bad' },{ paid_at: '2099-01-01T00:00:00Z' }])('manual receipt requires explicit verified input %#',(change) => expect(() => manualReceiptInput({ ...receipt,...change })).toThrow());
+test('manual receipt normalizes payment time and M-Pesa reference',() => expect(manualReceiptInput({ ...receipt,method: 'manual_mpesa',reference: ' abc123 ' })).toMatchObject({ paid_at: '2025-01-01T06:00:00.000Z',reference: 'ABC123' }));

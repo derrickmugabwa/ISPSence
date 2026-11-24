@@ -1,0 +1,8 @@
+FROM freeradius/freeradius-server:3.2.10@sha256:cc7fd136e7b03e7b332d94297530318e824a4ecfedbce54562cced723e71e812
+RUN rm -f /etc/raddb/sites-enabled/default /etc/raddb/sites-enabled/inner-tunnel /etc/raddb/mods-enabled/eap
+COPY clients.conf /etc/raddb/clients.conf
+COPY pppoe-db-test /etc/raddb/sites-enabled/pppoe-db-test
+COPY billing-db-rest /etc/raddb/mods-enabled/billing-db-rest
+COPY check-pppoe-db.sh /usr/local/bin/check-pppoe-db
+RUN sed -i 's/\r$//' /usr/local/bin/check-pppoe-db && chmod 755 /usr/local/bin/check-pppoe-db
+CMD ["/usr/local/bin/check-pppoe-db"]

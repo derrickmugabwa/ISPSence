@@ -1,0 +1,424 @@
+import { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { useNavigate } from 'react-router-dom';
+import { Radio, Signal, Activity, ShieldCheck, AlertTriangle } from 'lucide-react';
+import clsx from 'clsx';
+import { wirelessApi, networkServicesApi } from '../../services/api';
+import type {
+  RfChannelRow, RfSignalRow, RfTxQualityRow,
+  RfOverlapKind, RfBandRange,
+} from '../../types';
+import {
+  BAND_LABEL, RfBand,
+  RSSI_ZONES, rssiColor, RETRY_BUCKETS, retryBucketIndex, retryColor,
+} from '../../utils/wifiChannels';
+import { barGeometry } from '../../utils/spectrumGeometry';
+
+const ALL_BANDS: RfBand[] = ['2.4', '5', '6'];
+
+// ─── Channel Map ──────────────────────────────────────────────────────────────
+//
+// Drawn as real spectrum rather than a row of channel cells. Channel centres in
+// 2.4 GHz are 5 MHz apart while a channel is 20 MHz wide, so a cell-per-channel
+// model shows overlapping channels as free — bad advice for anyone planning a
+// deployment. Occupancy and interference are computed and tested server-side
+// (backend/src/utils/rfSpectrum.ts); this only positions the result.
+
+const OVERLAP_STYLE: Record<RfOverlapKind, { fill: string; label: string }> = {
+  clear:         { fill: 'var(--ok, #22c55e)',   label: 'Clear' },
+  'co-channel':  { fill: 'var(--warn, #f59e0b)', label: 'Shares a channel' },
+  partial:       { fill: 'var(--bad, #ef4444)',  label: 'Overlapping carriers' },
+};
+
+function SpectrumBandRow({ band, radios }: { band: RfBandRange; radios: RfChannelRow[] }) {
+  const span = band.endMhz - band.startMhz;
+  const pct = (mhz: number) => ((mhz - band.startMhz) / span) * 100;
+
+  // Stack radios so overlapping blocks stay individually visible.
+  const lanes: RfChannelRow[][] = [];
+  for (const r of [...radios].sort((a, b) => a.low_mhz - b.low_mhz)) {
+    const lane = lanes.find((l) => l[l.length - 1].high_mhz <= r.low_mhz);
+    if (lane) lane.push(r); else lanes.push([r]);
+  }
+
+  // Ticks every 20 MHz in 2.4 GHz, every 100 elsewhere — enough to orient without clutter.
+  const step = band.band === '2.4' ? 20 : 100;
+  const ticks: number[] = [];
+  for (let f = Math.ceil(band.startMhz / step) * step; f < band.endMhz; f += step) ticks.push(f);
+
+  // The 2.4 GHz axis is labelled by channel, so a tick outside the channel plan
+  // (2400 and 2480 both fall there) would print a bare frequency and break the
+  // sequence — reading "2400, 3, 7, 11, 2480" rather than as channels.
+  const labelledTicks = band.band === '2.4' ? ticks.filter((f) => channelOf(f) != null) : ticks;
+
+  return (
+    <div>
+      <div className="flex items-baseline justify-between mb-1">
+        <div className="text-xs font-medium text-gray-500 dark:text-slate-400">{band.label}</div>
+        <div className="text-[10px] text-gray-400">
+          {radios.length === 0 ? 'no radios' : `${radios.length} radio${radios.length !== 1 ? 's' : ''}`}
+        </div>
+      </div>
+
+      <div className="relative rounded" style={{ background: 'var(--surface-3, #e5e7eb)', minHeight: lanes.length ? lanes.length * 16 + 4 : 12 }}>
+        {lanes.map((lane, li) => lane.map((r) => {
+          const { leftPct, widthPct } = barGeometry(
+            r.low_mhz, r.high_mhz, band.startMhz, band.endMhz,
+          );
+          return (
+          <div
+            key={`${r.device_id}:${r.name}`}
+            title={[
+              `${r.device_name} · ${r.name}${r.ssid ? ` (${r.ssid})` : ''}`,
+              `ch ${r.channel ?? '?'} — ${r.low_mhz}–${r.high_mhz} MHz, ${r.width_mhz} MHz wide`,
+              `${r.registered_clients ?? 0} clients`,
+              OVERLAP_STYLE[r.overlap].label,
+              ...r.clashes.map((c) => `  ${c.kind === 'partial' ? 'overlaps' : 'shares with'} ${c.device_name} ch ${c.channel} (${c.overlap_mhz} MHz)`),
+            ].join('\n')}
+            className="absolute rounded-sm border border-black/10 dark:border-white/10"
+            style={{
+              left: `${leftPct}%`,
+              width: `${widthPct}%`,
+              top: li * 16 + 2,
+              height: 12,
+              background: OVERLAP_STYLE[r.overlap].fill,
+              opacity: 0.85,
+            }}
+          />
+          );
+        }))}
+      </div>
+
+      <div className="relative h-3 mt-0.5">
+        {labelledTicks.map((f) => {
+          const at = pct(f);
+          // A centred label on a tick at either extreme hangs half its width past
+          // the card. Anchor the outermost labels inward instead of centring them.
+          const anchor = at <= 3 ? 'translateX(0)' : at >= 97 ? 'translateX(-100%)' : 'translateX(-50%)';
+          return (
+            <span key={f} className="absolute text-[9px] leading-none text-gray-400 dark:text-slate-500"
+                  style={{ left: `${at}%`, transform: anchor }}>
+              {band.band === '2.4' ? (channelOf(f) ?? f) : f}
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** 2.4 GHz tick labels read better as channel numbers than as megahertz. */
+function channelOf(freq: number): number | null {
+  const n = Math.round((freq - 2407) / 5);
+  return n >= 1 && n <= 14 ? n : null;
+}
+
+export function ChannelMap({ deviceId }: { deviceId?: number }) {
+  const { data } = useQuery({
+    queryKey: ['rf-channels', deviceId],
+    queryFn: () => wirelessApi.getChannelUsage(deviceId).then(r => r.data),
+    refetchInterval: 60_000,
+  });
+
+  const locations = data?.locations ?? [];
+  const [location, setLocation] = useState<string>('all');
+
+  const radios = (data?.radios ?? []).filter(
+    r => location === 'all' || (r.controller_device_id != null ? `c:${r.controller_device_id}` : 'standalone') === location
+  );
+  const bands = (data?.bands ?? []).filter(b => b.band !== '6' || radios.some(r => r.low_mhz >= 5925));
+
+  const partial = radios.filter(r => r.overlap === 'partial').length;
+  const coChannel = radios.filter(r => r.overlap === 'co-channel').length;
+
+  return (
+    <div className="card p-4">
+      <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
+        <div className="flex items-center gap-2">
+          <Radio className="w-4 h-4 text-blue-500" />
+          <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">Channel Usage</h2>
+        </div>
+        {/* Channel planning is per physical location — two APs on channel 6 in
+            different buildings are not a conflict (issue #97). */}
+        {locations.length > 1 && (
+          <select value={location} onChange={(e) => setLocation(e.target.value)}
+                  className="input text-xs py-1 max-w-[220px]">
+            <option value="all">All locations</option>
+            {locations.map(l => (
+              <option key={l.key} value={l.key}>{l.name} ({l.radios})</option>
+            ))}
+          </select>
+        )}
+      </div>
+
+      {radios.length === 0 ? (
+        <div className="py-6 text-center text-xs text-gray-400">No active radios reporting a channel.</div>
+      ) : (
+        <>
+          <div className="space-y-3">
+            {bands.map(b => (
+              <SpectrumBandRow key={b.band} band={b}
+                radios={radios.filter(r => r.low_mhz < b.endMhz && r.high_mhz > b.startMhz)} />
+            ))}
+          </div>
+
+          <div className="mt-3 flex items-center gap-4 flex-wrap text-[11px] text-gray-500 dark:text-slate-400">
+            {(['clear', 'co-channel', 'partial'] as RfOverlapKind[]).map(k => (
+              <span key={k} className="flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-sm" style={{ background: OVERLAP_STYLE[k].fill }} />
+                {OVERLAP_STYLE[k].label}
+              </span>
+            ))}
+          </div>
+
+          <p className="mt-2 text-[11px] text-gray-500 dark:text-slate-400">
+            {partial > 0
+              ? `${partial} radio${partial !== 1 ? 's' : ''} overlap the edge of a neighbour's channel — the carriers collide rather than taking turns, which costs more than sharing a channel outright.`
+              : coChannel > 0
+                ? `${coChannel} radio${coChannel !== 1 ? 's' : ''} share a channel exactly. They hear each other and take turns, so this is airtime cost rather than interference.`
+                : 'No overlapping carriers. Radios either sit clear of each other or share a channel cleanly.'}
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── RSSI Density ──────────────────────────────────────────────────────────────
+
+const RSSI_MIN = -90;
+const RSSI_MAX = -30;
+const RSSI_TICKS = [-90, -80, -70, -60, -50, -40, -30];
+
+export function RssiDensity({ deviceId }: { deviceId?: number }) {
+  const navigate = useNavigate();
+  const { data: signals = [] } = useQuery({
+    queryKey: ['rf-signals', deviceId],
+    queryFn: () => wirelessApi.getClientSignals(deviceId).then(r => r.data),
+    refetchInterval: 30_000,
+  });
+
+  const clamped = (dbm: number) => Math.max(RSSI_MIN, Math.min(RSSI_MAX, dbm));
+  const pos = (dbm: number) => ((clamped(dbm) - RSSI_MIN) / (RSSI_MAX - RSSI_MIN)) * 100;
+
+  // Bin clients into 2 dB bins so co-located clients form a sized bubble.
+  const bins = new Map<number, RfSignalRow[]>();
+  for (const s of signals) {
+    const bin = Math.round(clamped(s.signal_strength) / 2) * 2;
+    if (!bins.has(bin)) bins.set(bin, []);
+    bins.get(bin)!.push(s);
+  }
+
+  const weak = signals.filter(s => s.signal_strength < -75).length;
+  const weakRatio = signals.length ? weak / signals.length : 0;
+  const needsImprovement = signals.length >= 3 && weakRatio > 0.3;
+
+  return (
+    <div className="card p-5">
+      <div className="flex items-center gap-2 mb-4">
+        <Signal className="w-4 h-4 text-emerald-500" />
+        <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">AP Deployment Density</h2>
+        <span className="ml-auto text-[11px] text-gray-400 dark:text-slate-500">
+          {signals.length} client{signals.length !== 1 ? 's' : ''} by signal (dBm)
+        </span>
+      </div>
+
+      {signals.length === 0 ? (
+        <div className="py-6 text-center text-sm text-gray-400 dark:text-slate-500">
+          No connected wireless clients to plot.
+        </div>
+      ) : (
+        <>
+          {needsImprovement && (
+            <div className="flex items-start gap-2 mb-3 text-xs text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 rounded-lg px-3 py-2">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+              <span>AP deployment density may need improvement — {weak} of {signals.length} clients are connecting below −75 dBm, which suggests coverage gaps.</span>
+            </div>
+          )}
+
+          {/* Density track */}
+          <div className="relative h-16">
+            {/* gradient zone background */}
+            <div className="absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full overflow-hidden flex">
+              {RSSI_ZONES.map(z => (
+                <div key={z.label} style={{
+                  width: `${((Math.min(z.max, RSSI_MAX) - Math.max(z.min, RSSI_MIN)) / (RSSI_MAX - RSSI_MIN)) * 100}%`,
+                  backgroundColor: z.color, opacity: 0.25,
+                }} />
+              ))}
+            </div>
+            {/* client bubbles */}
+            {Array.from(bins.entries()).map(([bin, rows]) => {
+              const size = Math.min(34, 12 + (rows.length - 1) * 4);
+              // Clicking a bubble opens the Clients page filtered to wireless clients
+              // in the signal zone that bubble sits in (#99). The zone rather than the
+              // 2 dB bin, because the bin is a drawing detail and the zone is the thing
+              // an operator is actually asking about.
+              const zone = RSSI_ZONES.find(z => bin >= z.min && bin < z.max) ?? RSSI_ZONES[0];
+              return (
+                <button key={bin}
+                  onClick={() => navigate(`/clients?type=wireless&smin=${zone.min}&smax=${zone.max}`)}
+                  title={[
+                    ...rows.map(r => `${r.custom_name || r.hostname || r.mac_address} (${r.signal_strength} dBm, ${r.device_name})`),
+                    '',
+                    `Click to list ${zone.label.toLowerCase()}-signal clients`,
+                  ].join('\n')}
+                  className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full flex items-center justify-center text-[10px] font-semibold text-white shadow ring-2 ring-white dark:ring-slate-800 hover:ring-blue-400 transition-shadow cursor-pointer"
+                  style={{ left: `${pos(bin)}%`, width: size, height: size, backgroundColor: rssiColor(bin) }}>
+                  {rows.length > 1 ? rows.length : ''}
+                </button>
+              );
+            })}
+          </div>
+          {/* axis */}
+          <div className="relative h-4 mt-1">
+            {RSSI_TICKS.map(t => (
+              <span key={t} className="absolute -translate-x-1/2 text-[10px] text-gray-400 dark:text-slate-500"
+                style={{ left: `${pos(t)}%` }}>{t}</span>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── TX Retries histogram ───────────────────────────────────────────────────────
+
+export function TxRetries({ deviceId }: { deviceId?: number }) {
+  const [band, setBand] = useState<RfBand>('5');
+  const { data: radios = [] } = useQuery({
+    queryKey: ['rf-tx-quality', deviceId],
+    queryFn: () => wirelessApi.getTxQuality(deviceId, '6h').then(r => r.data),
+    refetchInterval: 60_000,
+  });
+
+  const inBand = radios.filter((r: RfTxQualityRow) => r.band === band);
+  const counts = RETRY_BUCKETS.map(() => 0);
+  for (const r of inBand) counts[retryBucketIndex(r.tx_retry_pct)]++;
+  // UniFi orders worst → best (35%+ … 0%)
+  const ordered = RETRY_BUCKETS.map((b, i) => ({ ...b, count: counts[i] })).reverse();
+
+  return (
+    <div className="card p-5">
+      <div className="flex items-center gap-2 mb-4">
+        <Activity className="w-4 h-4 text-violet-500" />
+        <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">AP Radio TX Retries</h2>
+        <div className="ml-auto flex gap-1">
+          {ALL_BANDS.map(b => (
+            <button key={b} onClick={() => setBand(b)}
+              className={clsx('px-2 py-0.5 rounded-md text-xs font-medium transition-colors',
+                band === b ? 'bg-blue-600 text-white' : 'text-gray-500 dark:text-slate-400 hover:bg-gray-100 dark:hover:bg-slate-700')}>
+              {BAND_LABEL[b]}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {radios.length === 0 ? (
+        <div className="py-6 text-center text-sm text-gray-400 dark:text-slate-500">
+          No TX-retry data. This is derived from per-client CCQ, which the legacy
+          <span className="font-mono"> wireless</span> driver reports; Wi-Fi 6/7 (<span className="font-mono">wifi</span>) radios don&apos;t expose it.
+        </div>
+      ) : (
+        <>
+          <div className="flex gap-1">
+            {ordered.map(b => (
+              <div key={b.label} className="flex-1 text-center">
+                <div className="h-9 rounded-md flex items-center justify-center text-sm font-bold text-white"
+                  style={{ backgroundColor: b.count > 0 ? retryColor((b.min + Math.min(b.max, 40)) / 2) : 'var(--color-border, #e5e7eb)' }}>
+                  <span className={clsx(b.count === 0 && 'text-gray-400 dark:text-slate-600')}>{b.count || ''}</span>
+                </div>
+                <div className="text-[10px] text-gray-400 dark:text-slate-500 mt-1">{b.label}</div>
+              </div>
+            ))}
+          </div>
+          <p className="text-[11px] text-gray-400 dark:text-slate-500 mt-3">
+            Radios bucketed by transmit-retry rate over the last 6h ({inBand.length} on {BAND_LABEL[band]}). Lower is better.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── DHCP pool usage (#156) ───────────────────────────────────────────────────
+// Replaced the log-derived "WiFi Connectivity Success" funnel, which counted
+// ordinary disconnects as failures. A full pool is the quiet failure: clients
+// connect and get no address.
+
+export function DhcpPoolUsage() {
+  const { data: pools = [], isLoading } = useQuery({
+    queryKey: ['dhcp-pool-usage'],
+    queryFn: () => networkServicesApi.poolUsage().then((r) => r.data),
+    refetchInterval: 300_000,
+  });
+  return (
+    <div className="card p-5">
+      <div className="flex items-center gap-2 mb-1">
+        <ShieldCheck className="w-4 h-4 text-green-500" />
+        <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">DHCP pool usage</h2>
+      </div>
+      <p className="text-xs text-gray-500 dark:text-slate-400 mb-3">
+        How full each address pool is. When one runs out, clients connect but get no address. Yellow from 80%, red from 95%;
+        read every 5 minutes.
+      </p>
+      {isLoading ? null : pools.length === 0 ? (
+        <p className="py-4 text-center text-sm text-gray-400 dark:text-slate-500">No address pools on the devices in view.</p>
+      ) : (
+        <div className="space-y-2.5 max-h-[420px] overflow-y-auto pr-1">
+          {pools.map((p) => {
+            const pct = p.size ? Math.min(100, Math.round((p.used / p.size) * 100)) : null;
+            const color = p.state === 'full' ? '#ef4444' : p.state === 'warn' ? '#f59e0b' : '#22c55e';
+            return (
+              <div key={`${p.device_id}-${p.name}`}>
+                <div className="flex items-center justify-between gap-3 text-xs mb-1">
+                  <span className="truncate">
+                    <span className="font-medium text-gray-800 dark:text-slate-200">{p.name}</span>
+                    <span className="text-gray-400 dark:text-slate-500"> · {p.device_name}{p.ranges ? ` · ${p.ranges}` : ''}</span>
+                  </span>
+                  <span className="mono flex-shrink-0" style={{ color: p.state ? color : undefined }}>
+                    {p.used}{p.size ? ` / ${p.size}` : ''}{pct !== null ? ` (${pct}%)` : ''}
+                  </span>
+                </div>
+                <div className="h-1.5 rounded-full bg-gray-100 dark:bg-slate-700 overflow-hidden">
+                  <div className="h-full rounded-full" style={{ width: `${pct ?? 0}%`, background: color }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Combined section ─────────────────────────────────────────────────────────
+
+export default function RfHealth({ deviceId }: { deviceId?: number }) {
+  // TX retries come from CCQ, which only the legacy `wireless` driver reports. On
+  // an all-RouterOS-7 fleet the panel can never fill, so it is dropped and the
+  // density chart takes the full width rather than sitting beside an empty box
+  // (issue #96).
+  const { data: caps } = useQuery({
+    queryKey: ['rf-capabilities'],
+    queryFn: () => wirelessApi.getRfCapabilities().then(r => r.data),
+    staleTime: 300_000,
+  });
+  const showRetries = caps?.txRetriesAvailable ?? true;
+
+  return (
+    <div className="space-y-6">
+      <ChannelMap deviceId={deviceId} />
+      {showRetries ? (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+          <RssiDensity deviceId={deviceId} />
+          <TxRetries deviceId={deviceId} />
+        </div>
+      ) : (
+        <RssiDensity deviceId={deviceId} />
+      )}
+      <DhcpPoolUsage />
+    </div>
+  );
+}

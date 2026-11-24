@@ -1,0 +1,57 @@
+# Disposable fixture only. Never copied into the application's accounting lab.
+server pppoe_db_test {
+    listen {
+        type = auth
+        ipaddr = 127.0.0.1
+        port = 18120
+    }
+    listen {
+        type = acct
+        ipaddr = 127.0.0.1
+        port = 18130
+    }
+    authorize {
+        if ((!&User-Password && !&CHAP-Password) || (&User-Password && &CHAP-Password)) {
+            reject
+        }
+        update request {
+            &Tmp-IP-Address-0 := "%{Packet-Src-IP-Address}"
+            &Tmp-String-0 := "%{Packet-Authentication-Vector}"
+        }
+        update control {
+            &REST-HTTP-Header := "X-PPPoE-Lab-Token: $ENV{PPPOE_DB_LAB_TOKEN}"
+        }
+        # The 3.2 REST authenticate method requires User-Password and cannot
+        # transport CHAP. Both proofs are verified by the backend here instead.
+        billing_db_rest
+        if ((ok || updated) && &reply:Class && &reply:Framed-Pool && &reply:Mikrotik-Rate-Limit && &reply:Session-Timeout >= 1 && &reply:Session-Timeout <= 30) {
+            update control {
+                &Auth-Type := DB-Lab-Verified
+            }
+        }
+        else {
+            reject
+        }
+    }
+    authenticate {
+        # Only the verified, complete backend result can select this branch.
+        Auth-Type DB-Lab-Verified {
+            ok
+        }
+    }
+    accounting {
+        update request {
+            &Tmp-IP-Address-0 := "%{Packet-Src-IP-Address}"
+        }
+        update control {
+            &REST-HTTP-Header := "X-PPPoE-Lab-Token: $ENV{PPPOE_DB_LAB_TOKEN}"
+        }
+        billing_db_rest
+        if (ok || updated) {
+            ok
+        }
+        else {
+            do_not_respond
+        }
+    }
+}

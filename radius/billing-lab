@@ -1,0 +1,32 @@
+server billing_lab {
+    listen {
+        type = auth
+        ipaddr = 127.0.0.1
+        port = 1812
+    }
+    listen {
+        type = acct
+        ipaddr = 127.0.0.1
+        port = 1813
+    }
+    authorize {
+        # Accounting verification is not customer admission authorization.
+        reject
+    }
+    accounting {
+        update request {
+            &Tmp-IP-Address-0 := "%{Packet-Src-IP-Address}"
+        }
+        update control {
+            &REST-HTTP-Header := "Authorization: Bearer $ENV{RADIUS_BRIDGE_TOKEN}"
+        }
+        billing_rest
+        if (ok || updated) {
+            ok
+        }
+        else {
+            # No acknowledgement for a failed/non-durable backend write.
+            do_not_respond
+        }
+    }
+}

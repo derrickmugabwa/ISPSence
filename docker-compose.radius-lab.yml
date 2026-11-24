@@ -1,0 +1,21 @@
+services:
+  radius-lab:
+    build: ./radius
+    environment:
+      RADIUS_BRIDGE_TOKEN: ${RADIUS_BRIDGE_TOKEN:?Run scripts/setup-radius-lab.ps1 first}
+      RADIUS_LAB_SECRET: ${RADIUS_LAB_SECRET:?Run scripts/setup-radius-lab.ps1 first}
+    # No published ports and no router clients: this is an isolated protocol lab.
+    networks:
+      - radius-network
+    depends_on:
+      backend:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    user: "101:101"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/log/freeradius:uid=101,gid=101,mode=0770
+      - /var/run/freeradius:uid=101,gid=101,mode=0770
+    restart: unless-stopped

@@ -1,0 +1,8 @@
+# Separate, disposable protocol fixture. Never used by production Compose.
+FROM freeradius/freeradius-server:3.2.10@sha256:cc7fd136e7b03e7b332d94297530318e824a4ecfedbce54562cced723e71e812
+RUN rm -f /etc/raddb/sites-enabled/default /etc/raddb/sites-enabled/inner-tunnel /etc/raddb/mods-enabled/eap
+COPY clients.conf /etc/raddb/clients.conf
+COPY pppoe-test /etc/raddb/sites-enabled/pppoe-test
+COPY check-pppoe.sh /usr/local/bin/check-pppoe
+RUN sed -i 's/\r$//' /usr/local/bin/check-pppoe && chmod 755 /usr/local/bin/check-pppoe
+CMD ["/usr/local/bin/check-pppoe"]

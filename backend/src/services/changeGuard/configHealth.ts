@@ -1,0 +1,770 @@
+/**
+ * Config Health — a standing audit for configurations RouterOS accepts but that
+ * do not work.
+ *
+ * RouterOS applies each command immediately and independently, with no transaction
+ * and no cross-object validation. Contradictory state is accepted and simply
+ * misbehaves: an address on a bridge slave port is silently unreachable, a VLAN
+ * interface on a slave port takes the device off the network, a PVID next to
+ * `frame-type=admit-only-vlan-tagged` does nothing at all. MikroTik documents these
+ * on its Layer2 misconfiguration page — as prose. This module encodes them.
+ *
+ * Change Guard answers "will this change break reachability?". This answers the
+ * other half: "what is already wrong, and has been for a while?" — including
+ * configurations that work today only because a dynamic entry happens to exist.
+ *
+ * `auditConfig` is pure over a snapshot so every rule is testable against fixtures;
+ * persistence lives in `runConfigHealth`.
+ */
+import { query } from '../../config/database';
+import { expandVlanIds, rosList } from '../../utils/vlan';
+import {
+  captureSnapshot,
+  resolveManagementPath,
+  vlanMembership,
+  type DeviceSnapshot,
+  type RosRow,
+} from './pathModel';
+import type { GuardDevice } from './ChangeGuard';
+
+export type FindingSeverity = 'critical' | 'warning' | 'info';
+
+export interface ConfigFinding {
+  /** Stable rule identifier, e.g. 'ip-on-bridge-port'. */
+  rule: string;
+  /** Identifies this specific problem instance, so it can be tracked over time. */
+  fingerprint: string;
+  severity: FindingSeverity;
+  title: string;
+  /** What is wrong and what it actually does to the network. */
+  detail: string;
+  /** The concrete fix. */
+  remediation: string;
+  docUrl: string;
+  /** Device objects involved — interface names, VLAN ids, addresses. */
+  objects: string[];
+}
+
+const L2_DOC = 'https://help.mikrotik.com/docs/spaces/ROS/pages/19136718/Layer2+misconfiguration';
+const VLAN_TABLE_DOC = 'https://help.mikrotik.com/docs/spaces/ROS/pages/28606465/Bridge+VLAN+Table';
+const BRIDGING_DOC = 'https://help.mikrotik.com/docs/spaces/ROS/pages/328068/Bridging+and+Switching';
+
+const isTrue = (v: string | undefined): boolean => v === 'true' || v === 'yes';
+const stripCidr = (addr: string): string => (addr || '').split('/')[0].trim();
+
+/**
+ * Bridge ports that are actually carrying traffic. A disabled or inactive port is
+ * not slaved in practice, so configurations that would conflict with it do work —
+ * flagging them would be a false positive.
+ */
+function activeBridgePorts(snap: DeviceSnapshot): Map<string, RosRow> {
+  const map = new Map<string, RosRow>();
+  for (const p of snap.bridgePorts) {
+    const name = p['interface'];
+    if (!name) continue;
+    if (isTrue(p['disabled']) || isTrue(p['inactive'])) continue;
+    map.set(name, p);
+  }
+  return map;
+}
+
+// ─── rules ────────────────────────────────────────────────────────────────────
+
+/**
+ * An IP address on a bridge slave port.
+ *
+ * The naive form of this check is wrong on RouterOS 7, and real hardware proved it:
+ * a `defconf` address configured on a slave port is reported with `slave=true` and
+ * `actual-interface=<bridge>`, because RouterOS quietly relocates it to the bridge
+ * and it works perfectly. Calling that "unreachable" would be a false positive on a
+ * very common default configuration.
+ *
+ * So the severity follows what RouterOS actually did:
+ *  - relocated to the bridge  → informational; the address works, but the
+ *    configuration names an interface that is not the one serving it
+ *  - not relocated            → critical; the port hands frames to the bridge and
+ *    nothing terminates the address
+ */
+function ruleIpOnBridgePort(snap: DeviceSnapshot): ConfigFinding[] {
+  const ports = activeBridgePorts(snap);
+  const bridgeNames = new Set(snap.bridges.map((b) => b['name']).filter(Boolean));
+  const out: ConfigFinding[] = [];
+
+  for (const a of snap.addresses) {
+    if (isTrue(a['disabled']) || isTrue(a['invalid'])) continue;
+    const configured = a['interface'] || '';
+    const actual = a['actual-interface'] || configured;
+
+    // Only interesting when the address was configured on a port that is slaved to
+    // a bridge; an address configured directly on the bridge is entirely normal.
+    const port = ports.get(configured);
+    if (!port || bridgeNames.has(configured)) continue;
+
+    const relocated = actual !== configured && bridgeNames.has(actual);
+    if (relocated) {
+      out.push({
+        rule: 'ip-on-bridge-port',
+        fingerprint: `ip-on-bridge-port:${configured}:${a['address']}`,
+        severity: 'info',
+        title: `${a['address']} is configured on ${configured} but served by ${actual}`,
+        detail:
+          `${configured} is a member port of bridge ${actual}, so RouterOS moved the address to `
+          + `the bridge — it works, but the configuration names a port that is not the one `
+          + `answering. Anything reasoning about this address from the config alone, including `
+          + `firewall rules scoped to ${configured}, will not match where the traffic really is.`,
+        remediation:
+          `Move ${a['address']} onto ${actual} directly so the configuration says what is `
+          + `actually happening.`,
+        docUrl: L2_DOC,
+        objects: [configured, actual, a['address']],
+      });
+      continue;
+    }
+
+    out.push({
+      rule: 'ip-on-bridge-port',
+      fingerprint: `ip-on-bridge-port:${configured}:${a['address']}`,
+      severity: 'critical',
+      title: `${a['address']} is unreachable — it sits on bridge port ${configured}`,
+      detail:
+        `${configured} is a member port of bridge ${port['bridge']}, so it forwards every frame `
+        + `into the bridge instead of terminating it locally, and RouterOS has not relocated the `
+        + `address to the bridge. ${a['address']} is configured but nothing can reach it.`,
+      remediation:
+        `Move the address onto ${port['bridge']} itself (or onto a VLAN interface on that bridge), `
+        + `or remove ${configured} from the bridge if it is meant to be routed.`,
+      docUrl: L2_DOC,
+      objects: [configured, a['address']],
+    });
+  }
+  return out;
+}
+
+/**
+ * A VLAN interface whose parent is a bridge slave port. MikroTik's own wording for
+ * this case is that the device becomes unreachable: the parent port passes frames to
+ * the bridge, so the VLAN interface never sees them.
+ */
+function ruleVlanIfaceOnBridgePort(snap: DeviceSnapshot): ConfigFinding[] {
+  const ports = activeBridgePorts(snap);
+  const out: ConfigFinding[] = [];
+  for (const v of snap.vlanInterfaces) {
+    if (isTrue(v['disabled'])) continue;
+    const parent = v['interface'] || '';
+    const port = ports.get(parent);
+    if (!port) continue;
+    out.push({
+      rule: 'vlan-iface-on-bridge-port',
+      fingerprint: `vlan-iface-on-bridge-port:${v['name']}`,
+      severity: 'critical',
+      title: `VLAN interface ${v['name']} is built on bridge port ${parent}`,
+      detail:
+        `${parent} is a member of bridge ${port['bridge']}, so tagged frames are handed to the `
+        + `bridge rather than to ${v['name']}. The VLAN interface receives nothing, and anything `
+        + `depending on it — including management — is unreachable.`,
+      remediation:
+        `Create the VLAN interface on bridge ${port['bridge']} instead of on ${parent}, and let the `
+        + `bridge VLAN table decide which ports carry VLAN ${v['vlan-id']}.`,
+      docUrl: L2_DOC,
+      objects: [v['name'], parent],
+    });
+  }
+  return out;
+}
+
+/**
+ * A VLAN interface added as a bridge port. Documented as causing loops and RSTP
+ * flapping, because the tagged traffic re-enters the same broadcast domain.
+ */
+function ruleBridgedVlanInterface(snap: DeviceSnapshot): ConfigFinding[] {
+  const vlanNames = new Set(snap.vlanInterfaces.map((v) => v['name']).filter(Boolean));
+  const out: ConfigFinding[] = [];
+  for (const p of snap.bridgePorts) {
+    const name = p['interface'];
+    if (!name || !vlanNames.has(name)) continue;
+    if (isTrue(p['disabled'])) continue;
+    out.push({
+      rule: 'bridged-vlan-interface',
+      fingerprint: `bridged-vlan-interface:${p['bridge']}:${name}`,
+      severity: 'critical',
+      title: `VLAN interface ${name} is a port of bridge ${p['bridge']}`,
+      detail:
+        `Adding a VLAN interface as a bridge port feeds tagged traffic back into the same `
+        + `broadcast domain it came from. This creates a forwarding loop, and where STP is `
+        + `running it shows up as ports flapping between forwarding and blocking.`,
+      remediation:
+        `Remove ${name} from bridge ${p['bridge']} and use the bridge VLAN table to carry the `
+        + `VLAN on the physical ports instead.`,
+      docUrl: L2_DOC,
+      objects: [name, p['bridge']],
+    });
+  }
+  return out;
+}
+
+/**
+ * A bonding slave that is also directly a bridge port. The bond and the bridge both
+ * claim the interface; traffic takes an undefined path and the bond loses members
+ * without saying so.
+ */
+function ruleBondSlaveIsBridgePort(snap: DeviceSnapshot): ConfigFinding[] {
+  const ports = activeBridgePorts(snap);
+  const out: ConfigFinding[] = [];
+  for (const bond of snap.bonds) {
+    if (isTrue(bond['disabled'])) continue;
+    for (const slave of rosList(bond['slaves'])) {
+      const port = ports.get(slave);
+      if (!port) continue;
+      out.push({
+        rule: 'bond-slave-is-bridge-port',
+        fingerprint: `bond-slave-is-bridge-port:${bond['name']}:${slave}`,
+        severity: 'critical',
+        title: `${slave} is both a slave of bond ${bond['name']} and a port of bridge ${port['bridge']}`,
+        detail:
+          `An interface can belong to a bond or to a bridge, not both. With both configured the `
+          + `forwarding path is undefined: frames may bypass the bond, and the bond silently runs `
+          + `with fewer working members than it reports.`,
+        remediation:
+          `Remove ${slave} from bridge ${port['bridge']} and add the bond ${bond['name']} as the `
+          + `bridge port instead.`,
+        docUrl: BRIDGING_DOC,
+        objects: [slave, bond['name'], port['bridge']],
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * MTU above L2MTU. The interface accepts the larger MTU and then cannot carry it;
+ * small packets pass and large ones vanish, which is why this usually surfaces as
+ * "the network works but file transfers hang".
+ */
+function ruleMtuExceedsL2Mtu(snap: DeviceSnapshot): ConfigFinding[] {
+  const out: ConfigFinding[] = [];
+  for (const i of snap.interfaces) {
+    if (isTrue(i['disabled'])) continue;
+    const mtu = parseInt(i['mtu'] || '', 10);
+    const l2mtu = parseInt(i['l2mtu'] || '', 10);
+    if (isNaN(mtu) || isNaN(l2mtu) || l2mtu <= 0) continue;
+    if (mtu <= l2mtu) continue;
+    out.push({
+      rule: 'mtu-exceeds-l2mtu',
+      fingerprint: `mtu-exceeds-l2mtu:${i['name']}`,
+      severity: 'warning',
+      title: `${i['name']} has MTU ${mtu} above its L2MTU of ${l2mtu}`,
+      detail:
+        `The interface is configured to carry ${mtu}-byte payloads but the underlying layer-2 `
+        + `path only supports ${l2mtu}. Frames above the L2MTU are dropped without an error, so `
+        + `small traffic works while large transfers stall.`,
+      remediation:
+        `Lower the MTU on ${i['name']} to ${l2mtu} or below, or raise the L2MTU on this interface `
+        + `and every interface along the path.`,
+      docUrl: L2_DOC,
+      objects: [i['name']],
+    });
+  }
+  return out;
+}
+
+/**
+ * A bridge VLAN entry covering several VLANs while also listing untagged ports.
+ * RouterOS prints a warning for this and applies it anyway: every listed VLAN
+ * becomes untagged on those ports, which is almost never what was intended.
+ */
+function ruleMultiVidUntagged(snap: DeviceSnapshot): ConfigFinding[] {
+  const out: ConfigFinding[] = [];
+  for (const row of snap.bridgeVlans) {
+    if (isTrue(row['dynamic'])) continue;
+    const vids = expandVlanIds(row['vlan-ids']);
+    if (vids.length < 2) continue;
+    const untagged = rosList(row['untagged']);
+    if (untagged.length === 0) continue;
+    out.push({
+      rule: 'multi-vid-untagged',
+      fingerprint: `multi-vid-untagged:${row['bridge']}:${row['vlan-ids']}`,
+      severity: 'warning',
+      title: `Bridge VLAN entry ${row['vlan-ids']} on ${row['bridge']} has untagged ports`,
+      detail:
+        `This one entry covers ${vids.length} VLANs and marks ${untagged.join(', ')} untagged in `
+        + `all of them. A port can only meaningfully be untagged in one VLAN, so the result is `
+        + `ambiguous. RouterOS warns about this and applies it regardless.`,
+      remediation:
+        `Split the entry: keep the range for tagged trunk ports, and give each untagged access `
+        + `port its own single-VLAN entry with a matching PVID.`,
+      docUrl: VLAN_TABLE_DOC,
+      objects: [row['bridge'], row['vlan-ids'], ...untagged],
+    });
+  }
+  return out;
+}
+
+/**
+ * A PVID next to `frame-type=admit-only-vlan-tagged`. The docs are explicit that
+ * this frame-type disables the dynamic untagged entry that a PVID would create, so
+ * the PVID is inert — the classic "configuration that looks like it does something".
+ */
+function rulePvidWithTaggedOnlyFrameType(snap: DeviceSnapshot): ConfigFinding[] {
+  const out: ConfigFinding[] = [];
+  for (const p of snap.bridgePorts) {
+    if (isTrue(p['disabled'])) continue;
+    if (p['frame-types'] !== 'admit-only-vlan-tagged' && p['frame-type'] !== 'admit-only-vlan-tagged') continue;
+    const pvid = parseInt(p['pvid'] || '1', 10);
+    if (isNaN(pvid) || pvid === 1) continue;
+    out.push({
+      rule: 'pvid-with-tagged-only-frame-type',
+      fingerprint: `pvid-with-tagged-only-frame-type:${p['bridge']}:${p['interface']}`,
+      severity: 'warning',
+      title: `PVID ${pvid} on ${p['interface']} has no effect`,
+      detail:
+        `${p['interface']} admits only VLAN-tagged frames, which disables the dynamic untagged `
+        + `entry a PVID would otherwise create. The PVID of ${pvid} is stored but never applied, `
+        + `so untagged devices on this port are dropped rather than placed in VLAN ${pvid}.`,
+      remediation:
+        `Either set frame-types back to admit-all (or admit-only-untagged-and-priority-tagged) if `
+        + `untagged traffic belongs here, or clear the PVID so the configuration says what it does.`,
+      docUrl: VLAN_TABLE_DOC,
+      objects: [p['interface'], p['bridge'], String(pvid)],
+    });
+  }
+  return out;
+}
+
+/**
+ * Hardware offload can only be applied to one bridge per switch chip. When a second
+ * bridge also has hw ports, one of them silently falls back to CPU forwarding and
+ * throughput collapses under load without any error.
+ */
+function ruleMultipleHwBridges(snap: DeviceSnapshot): ConfigFinding[] {
+  const hwBridges = new Set<string>();
+  for (const p of snap.bridgePorts) {
+    if (isTrue(p['disabled'])) continue;
+    if (isTrue(p['hw'])) hwBridges.add(p['bridge']);
+  }
+  if (hwBridges.size < 2) return [];
+  const names = [...hwBridges].sort();
+  return [{
+    rule: 'multiple-hw-bridges',
+    fingerprint: `multiple-hw-bridges:${names.join(',')}`,
+    severity: 'warning',
+    title: `${names.length} bridges request hardware offload (${names.join(', ')})`,
+    detail:
+      `A switch chip can hardware-offload the ports of only one bridge. With several bridges `
+      + `asking for it, the ones that lose out fall back to CPU forwarding — no error is raised, `
+      + `but throughput on those ports drops to what the CPU can handle.`,
+    remediation:
+      `Consolidate the ports onto a single hardware-offloaded bridge and separate the networks `
+      + `with the bridge VLAN table, or accept CPU forwarding and disable hw on the extra bridges.`,
+    docUrl: BRIDGING_DOC,
+    objects: names,
+  }];
+}
+
+/**
+ * A VLAN interface on a VLAN-filtering bridge whose VLAN the bridge is not tagged
+ * in. The bridge is the CPU port: without tagged membership the VLAN interface is
+ * up and carries nothing.
+ */
+function ruleVlanIfaceNotTaggedOnBridge(snap: DeviceSnapshot): ConfigFinding[] {
+  const out: ConfigFinding[] = [];
+  const filtering = new Set(
+    snap.bridges.filter((b) => isTrue(b['vlan-filtering'])).map((b) => b['name'])
+  );
+  for (const v of snap.vlanInterfaces) {
+    if (isTrue(v['disabled'])) continue;
+    const parent = v['interface'] || '';
+    if (!filtering.has(parent)) continue;
+    const vid = parseInt(v['vlan-id'] || '', 10);
+    if (isNaN(vid)) continue;
+    const membership = vlanMembership(snap, parent, vid);
+    if (membership.tagged.includes(parent)) continue;
+    out.push({
+      rule: 'vlan-iface-not-tagged-on-bridge',
+      fingerprint: `vlan-iface-not-tagged-on-bridge:${v['name']}`,
+      severity: 'critical',
+      title: `${v['name']} carries no traffic — ${parent} is not tagged in VLAN ${vid}`,
+      detail:
+        `${parent} has VLAN filtering enabled, and the bridge itself is the CPU port. For `
+        + `${v['name']} to receive VLAN ${vid}, ${parent} must be listed as a tagged member of `
+        + `VLAN ${vid} in the bridge VLAN table. `
+        + (membership.found
+          ? `The VLAN exists on the bridge but ${parent} is not tagged in it.`
+          : `There is no bridge VLAN entry for VLAN ${vid} at all.`),
+      remediation:
+        `Add ${parent} to the tagged list of VLAN ${vid} on bridge ${parent} in the bridge VLAN table.`,
+      docUrl: VLAN_TABLE_DOC,
+      objects: [v['name'], parent, String(vid)],
+    });
+  }
+  return out;
+}
+
+/**
+ * The management VLAN membership that keeps the manager connected exists only as a
+ * dynamic entry created by a port PVID. It works right now, but any change that
+ * stops PVIDs creating dynamic entries — setting frame-types to tagged-only being
+ * the documented one — removes it and takes the device off the network.
+ */
+function ruleMgmtVlanDynamicOnly(snap: DeviceSnapshot, device: GuardDevice): ConfigFinding[] {
+  const path = resolveManagementPath(snap, device);
+  if (!path.bridge || !path.bridgeVlanFiltering || path.mgmtVlanId === null) return [];
+  if (path.taggedManagement) return [];
+
+  const vid = path.mgmtVlanId;
+  const membership = vlanMembership(snap, path.bridge, vid);
+  const effective = membership.untagged.includes(path.bridge) || membership.tagged.includes(path.bridge);
+  const isStatic = membership.untaggedStatic.includes(path.bridge) || membership.taggedStatic.includes(path.bridge);
+  if (!effective || isStatic) return [];
+
+  return [{
+    rule: 'mgmt-vlan-dynamic-only',
+    fingerprint: `mgmt-vlan-dynamic-only:${path.bridge}:${vid}`,
+    severity: 'warning',
+    title: `Management on VLAN ${vid} depends on a dynamic bridge VLAN entry`,
+    detail:
+      `Bridge ${path.bridge} carries management on VLAN ${vid}, but its membership in that VLAN `
+      + `is not configured — it exists only as a dynamic entry derived from a port PVID. That `
+      + `entry disappears the moment a port is set to admit only tagged frames, and management `
+      + `goes with it. Nothing in the saved configuration records why this device is reachable.`,
+    remediation:
+      `Add ${path.bridge} explicitly to VLAN ${vid} in the bridge VLAN table (untagged, matching `
+      + `how management arrives today) so the reachability is written down rather than incidental.`,
+    docUrl: VLAN_TABLE_DOC,
+    objects: [path.bridge, String(vid)],
+  }];
+}
+
+/**
+ * A port on a VLAN-filtering bridge that belongs to no VLAN. Every frame entering it
+ * is dropped by ingress filtering — the port is up, linked, and completely dead.
+ */
+function rulePortInNoVlan(snap: DeviceSnapshot): ConfigFinding[] {
+  const filtering = new Set(
+    snap.bridges.filter((b) => isTrue(b['vlan-filtering'])).map((b) => b['name'])
+  );
+  if (filtering.size === 0) return [];
+
+  const member = new Set<string>();
+  for (const row of snap.bridgeVlans) {
+    for (const p of rosList(row['current-tagged'] ?? row['tagged'])) member.add(`${row['bridge']}:${p}`);
+    for (const p of rosList(row['current-untagged'] ?? row['untagged'])) member.add(`${row['bridge']}:${p}`);
+  }
+
+  const out: ConfigFinding[] = [];
+  for (const p of snap.bridgePorts) {
+    const name = p['interface'];
+    const bridge = p['bridge'];
+    if (!name || !bridge || !filtering.has(bridge)) continue;
+    if (isTrue(p['disabled']) || isTrue(p['inactive'])) continue;
+    if (member.has(`${bridge}:${name}`)) continue;
+    out.push({
+      rule: 'port-in-no-vlan',
+      fingerprint: `port-in-no-vlan:${bridge}:${name}`,
+      severity: 'warning',
+      title: `${name} is a member of no VLAN on VLAN-filtering bridge ${bridge}`,
+      detail:
+        `${bridge} enforces the VLAN table on ingress, and ${name} appears in no entry — not `
+        + `tagged, not untagged, and not via a PVID-derived dynamic entry. Anything plugged into `
+        + `this port links up and is then dropped silently.`,
+      remediation:
+        `Either add ${name} to the VLANs it should carry, or remove it from ${bridge} so the `
+        + `configuration reflects that it is unused.`,
+      docUrl: VLAN_TABLE_DOC,
+      objects: [name, bridge],
+    });
+  }
+  return out;
+}
+
+/**
+ * Two interfaces holding the same address. Only one can answer; which one wins is
+ * not something the configuration states.
+ */
+function ruleDuplicateAddress(snap: DeviceSnapshot): ConfigFinding[] {
+  const byAddr = new Map<string, string[]>();
+  for (const a of snap.addresses) {
+    if (isTrue(a['disabled']) || isTrue(a['invalid'])) continue;
+    const ip = stripCidr(a['address']);
+    if (!ip) continue;
+    const iface = a['actual-interface'] || a['interface'] || '?';
+    byAddr.set(ip, [...(byAddr.get(ip) ?? []), iface]);
+  }
+  const out: ConfigFinding[] = [];
+  for (const [ip, ifaces] of byAddr) {
+    if (ifaces.length < 2) continue;
+    out.push({
+      rule: 'duplicate-address',
+      fingerprint: `duplicate-address:${ip}`,
+      severity: 'warning',
+      title: `${ip} is configured on ${ifaces.length} interfaces`,
+      detail:
+        `${ip} appears on ${ifaces.join(', ')}. Only one of them can answer for it, and which one `
+        + `depends on internal ordering rather than on anything in the configuration.`,
+      remediation: `Remove the address from every interface except the one that should own it.`,
+      docUrl: L2_DOC,
+      objects: [ip, ...ifaces],
+    });
+  }
+  return out;
+}
+
+// ─── audit ────────────────────────────────────────────────────────────────────
+
+const SEVERITY_RANK: Record<FindingSeverity, number> = { critical: 0, warning: 1, info: 2 };
+
+/** Run every rule against a snapshot. Pure — no device or database access. */
+
+const STP_DOC = 'https://help.mikrotik.com/docs/spaces/ROS/pages/328068/Bridging+and+Switching#BridgingandSwitching-SpanningTreeProtocol';
+
+/**
+ * Spanning tree turned off on a bridge with more than one active port.
+ *
+ * RouterOS accepts `protocol-mode=none` without comment, and on a correctly
+ * cabled network nothing happens — which is precisely why it is dangerous. STP
+ * is not what makes the network work; it is what stops a second cable between
+ * two switches from becoming a broadcast storm that saturates every link and
+ * takes the segment down. With it off there is nothing to detect that loop and
+ * nothing to break it.
+ *
+ * Single-port bridges are ignored: they cannot loop.
+ */
+function ruleStpDisabled(snap: DeviceSnapshot): ConfigFinding[] {
+  const out: ConfigFinding[] = [];
+  for (const b of snap.bridges) {
+    const name = b['name'];
+    if (!name) continue;
+    const mode = (b['protocol-mode'] || '').toLowerCase();
+    if (mode !== 'none') continue;
+
+    const ports = snap.bridgePorts
+      .filter((p) => p['bridge'] === name && !isTrue(p['disabled']))
+      .map((p) => p['interface'])
+      .filter(Boolean);
+    if (ports.length < 2) continue;
+
+    out.push({
+      rule: 'stp-disabled',
+      fingerprint: `stp-disabled:${name}`,
+      severity: 'warning',
+      title: `Spanning tree is off on bridge ${name} (${ports.length} active ports)`,
+      detail:
+        `protocol-mode is "none", so this bridge runs no spanning tree. Nothing is wrong `
+        + `while the cabling is correct — but a second path between two switches, whether `
+        + `patched deliberately or by accident, becomes a forwarding loop. A loop at layer 2 `
+        + `has no TTL to stop it: broadcasts multiply until the segment is unusable, and it `
+        + `usually takes the management path with it.`,
+      remediation:
+        `Set a spanning tree protocol on the bridge: /interface/bridge set ${name} `
+        + `protocol-mode=rstp. Leave it off only where the bridge physically cannot loop.`,
+      docUrl: STP_DOC,
+      objects: [name, ...ports],
+    });
+  }
+  return out;
+}
+
+/**
+ * Classic STP where RSTP would do.
+ *
+ * Both prevent loops; they differ in how long the network is down while they
+ * work it out. Classic STP walks listening and learning on a timer — 30 to 50
+ * seconds before a port forwards. RSTP negotiates with its neighbour and is
+ * usually sub-second. The difference is only visible when a link fails, which is
+ * exactly when it is least welcome.
+ */
+function ruleStpLegacyMode(snap: DeviceSnapshot): ConfigFinding[] {
+  return snap.bridges
+    .filter((b) => b['name'] && (b['protocol-mode'] || '').toLowerCase() === 'stp')
+    .map((b) => ({
+      rule: 'stp-legacy-mode',
+      fingerprint: `stp-legacy-mode:${b['name']}`,
+      severity: 'info' as FindingSeverity,
+      title: `Bridge ${b['name']} runs classic STP rather than RSTP`,
+      detail:
+        `Recovery from a failed link takes 30-50 seconds under classic STP, against `
+        + `well under a second with RSTP. Everything through this bridge is offline for that `
+        + `whole interval. RSTP falls back to classic automatically when it meets a neighbour `
+        + `that only speaks it, so changing this is safe even in a mixed network.`,
+      remediation: `/interface/bridge set ${b['name']} protocol-mode=rstp`,
+      docUrl: STP_DOC,
+      objects: [b['name']],
+    }));
+}
+
+const DEVICE_MODE_DOC = 'https://help.mikrotik.com/docs/spaces/ROS/pages/93749258/Device-mode';
+
+/** Device-mode features the manager relies on, and what each one powers here. */
+const MANAGER_FEATURES: { key: string; what: string }[] = [
+  { key: 'bandwidth-test', what: 'the bandwidth test tool' },
+  { key: 'sniffer', what: 'packet capture' },
+  { key: 'hotspot', what: 'the Guest WiFi wizard (hotspot)' },
+  { key: 'fetch', what: 'adopting new devices through this one' },
+];
+
+/**
+ * RouterOS device-mode blocking what the manager uses (#230).
+ *
+ * Device-mode switches RouterOS features off below the configuration: a
+ * command for a blocked feature fails with "not allowed by device-mode", and
+ * changing it needs someone at the device to press its button or power-cycle
+ * it. Found out at the worst moment, as the reason a protected change couldn't
+ * run, so it's raised ahead of time.
+ */
+function ruleDeviceMode(snap: DeviceSnapshot): ConfigFinding[] {
+  const dm = snap.deviceMode;
+  if (!dm) return [];
+  const fields = new Map(Object.entries(dm));
+  const blocked = (key: string) => ['false', 'no'].includes(fields.get(key) ?? '');
+  const mode = dm['mode'] || 'unknown';
+  const out: ConfigFinding[] = [];
+  const how = `Changing device-mode needs physical access: run /system/device-mode/update with the `
+    + `feature set to yes, then press the device's reset or mode button (or power-cycle it) within `
+    + `the confirmation window.`;
+
+  if (isTrue(dm['flagged'])) {
+    out.push({
+      rule: 'device-mode-flagged',
+      fingerprint: 'device-mode-flagged',
+      severity: 'warning',
+      title: 'RouterOS has flagged this device',
+      detail: `RouterOS flags a device when it finds configuration it considers suspicious, and `
+        + `then refuses to change device-mode until the flag is cleared. Something on this device `
+        + `triggered it, which is worth checking for compromise.`,
+      remediation: `Review the configuration for anything you didn't add, then clear the flag `
+        + `with /system/device-mode/update flagged=no and confirm at the device. ${how}`,
+      docUrl: DEVICE_MODE_DOC,
+      objects: [],
+    });
+  }
+
+  if (blocked('scheduler')) {
+    out.push({
+      rule: 'device-mode-no-scheduler',
+      fingerprint: 'device-mode-no-scheduler',
+      severity: 'warning',
+      title: `Device-mode (${mode}) blocks the scheduler, so Change Guard can't protect changes`,
+      detail: `Change Guard arms its automatic undo as a scheduler entry on the device. With the `
+        + `scheduler blocked it can't, and a change that could cut off management is refused rather `
+        + `than made unprotected.`,
+      remediation: `Allow the scheduler: /system/device-mode/update scheduler=yes. ${how}`,
+      docUrl: DEVICE_MODE_DOC,
+      objects: ['scheduler'],
+    });
+  }
+
+  const off = MANAGER_FEATURES.filter((f) => blocked(f.key));
+  if (off.length > 0) {
+    out.push({
+      rule: 'device-mode-blocks-features',
+      fingerprint: `device-mode-blocks-features:${off.map((f) => f.key).join(',')}`,
+      severity: 'info',
+      title: `Device-mode (${mode}) blocks ${off.map((f) => f.key).join(', ')}`,
+      detail: `These are switched off on the device, so ${off.map((f) => f.what).join(', ')} won't `
+        + `work here; RouterOS answers "not allowed by device-mode". That's fine if it's deliberate.`,
+      remediation: `Allow what you need, for example /system/device-mode/update `
+        + `${off.map((f) => `${f.key}=yes`).join(' ')}. ${how}`,
+      docUrl: DEVICE_MODE_DOC,
+      objects: off.map((f) => f.key),
+    });
+  }
+  return out;
+}
+
+/**
+ * Routing between VLANs on the CPU of a switch that could do it in hardware
+ * (#254). A Marvell 98DX switch chip (CRS3xx, CRS5xx, CCR2116, CCR2216) can
+ * route between VLAN interfaces at wire speed with L3 hardware offloading;
+ * with it off, every routed packet goes through the CPU, a fraction of the
+ * ports' speed. Info rather than a warning: it isn't broken, and turning
+ * offloading on means routed traffic no longer passes the firewall.
+ */
+export function ruleL3HwOffloadOff(snap: DeviceSnapshot): ConfigFinding[] {
+  const chip = (snap.switches ?? []).find((s) => isL3HwChip(s['type']));
+  if (!chip || isTrue(chip['l3-hw-offloading'])) return [];
+  const vlanNames = new Set(snap.vlanInterfaces.filter((v) => !isTrue(v['disabled'])).map((v) => v['name']));
+  const routed = [...new Set(snap.addresses
+    .filter((a) => !isTrue(a['disabled']) && vlanNames.has(a['interface']))
+    .map((a) => a['interface']))].sort();
+  if (routed.length < 2) return [];
+  return [{
+    rule: 'l3-hw-offload-off',
+    // Per chip, not per VLAN set: adding a VLAN shouldn't make it a new finding.
+    fingerprint: `l3-hw-offload-off:${chip['name'] || 'switch1'}`,
+    severity: 'info',
+    title: `Routing between ${routed.length} VLANs runs on the CPU`,
+    detail: `${routed.join(', ')} have addresses, so this device routes between them, and its switch chip ` +
+      `(${chip['type']}) can do that in hardware, but L3 hardware offloading is off. Every routed packet ` +
+      `goes through the CPU, at a fraction of the ports' speed.`,
+    remediation: 'Turn on L3 hardware offloading from the device\u2019s L3 offload card (VLANs tab). Routed traffic then ' +
+      'bypasses the CPU, so firewall filter and NAT rules no longer apply to it: check that nothing relies on them first. ' +
+      'Only VLAN interfaces on a hardware-offloaded bridge with VLAN filtering are routed in hardware.',
+    objects: [chip['name'] || 'switch1', ...routed],
+    docUrl: 'https://help.mikrotik.com/docs/spaces/ROS/pages/62390319/L3+Hardware+Offloading',
+  }];
+}
+
+/** A switch chip that supports L3 hardware offloading: Marvell Prestera 98DX. */
+export function isL3HwChip(type: string | undefined): boolean {
+  return /^Marvell-98DX/i.test(type || '');
+}
+
+export function auditConfig(snap: DeviceSnapshot, device: GuardDevice): ConfigFinding[] {
+  const findings = [
+    ...ruleIpOnBridgePort(snap),
+    ...ruleVlanIfaceOnBridgePort(snap),
+    ...ruleBridgedVlanInterface(snap),
+    ...ruleBondSlaveIsBridgePort(snap),
+    ...ruleVlanIfaceNotTaggedOnBridge(snap),
+    ...ruleMgmtVlanDynamicOnly(snap, device),
+    ...rulePortInNoVlan(snap),
+    ...ruleMultiVidUntagged(snap),
+    ...rulePvidWithTaggedOnlyFrameType(snap),
+    ...ruleMultipleHwBridges(snap),
+    ...ruleMtuExceedsL2Mtu(snap),
+    ...ruleDuplicateAddress(snap),
+    ...ruleStpDisabled(snap),
+    ...ruleStpLegacyMode(snap),
+    ...ruleDeviceMode(snap),
+    ...ruleL3HwOffloadOff(snap),
+  ];
+  return findings.sort(
+    (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] || a.rule.localeCompare(b.rule)
+  );
+}
+
+export interface ConfigHealthResult {
+  findings: ConfigFinding[];
+  checkedAt: Date;
+}
+
+/**
+ * Audit a device and persist the result. Findings are upserted so `first_seen`
+ * records how long a problem has existed, and anything absent from this run is
+ * removed — the table always describes the device as it is now.
+ */
+export async function runConfigHealth(device: GuardDevice): Promise<ConfigHealthResult> {
+  const snap = await captureSnapshot(device);
+  const findings = auditConfig(snap, device);
+  const checkedAt = new Date();
+
+  for (const f of findings) {
+    await query(
+      `INSERT INTO device_config_findings
+         (device_id, rule, fingerprint, severity, title, detail, remediation, doc_url, objects, last_seen)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+       ON CONFLICT (device_id, fingerprint) DO UPDATE SET
+         rule=$2, severity=$4, title=$5, detail=$6, remediation=$7, doc_url=$8, objects=$9, last_seen=NOW()`,
+      [device.id, f.rule, f.fingerprint, f.severity, f.title, f.detail, f.remediation, f.docUrl, f.objects]
+    );
+  }
+
+  await query(
+    `DELETE FROM device_config_findings
+     WHERE device_id = $1 AND NOT (fingerprint = ANY($2::text[]))`,
+    [device.id, findings.map((f) => f.fingerprint)]
+  );
+
+  await query(`UPDATE devices SET config_health_checked_at = NOW() WHERE id = $1`, [device.id]);
+
+  return { findings, checkedAt };
+}

@@ -1,0 +1,26 @@
+import { callbackOrigin, checkPaymentEvidence, parsePayHeroCallback, payHeroRequest, providerAmount, providerOrigin, type PayHeroConfig, type Transport } from '../payheroAdapter';
+const config: PayHeroConfig = { id: 1,enabled: true,mode: 'sandbox',base_url: 'https://backend.payhero.co.ke',channel_id: 12,account_id: 9,public_origin: 'https://billing.example.com',credentials_encrypted: 'unused' };
+const attempt = { external_reference: 'PH-test',provider_reference: 'provider-ref',checkout_id: 'checkout-id' };
+const purchase = { amount_minor: 5000,payer_phone: '+254712345678',currency: 'KES' };
+const callback = parsePayHeroCallback({ response: { Amount: 50,ExternalReference: attempt.external_reference,CheckoutRequestID: attempt.checkout_id,MpesaReceiptNumber: 'RECEIPT1',Phone: '0712345678',ResultCode: 0 } });
+const evidence = { reference: 'provider-ref',provider: 'm-pesa',status: 'SUCCESS',success: true,provider_reference: 'RECEIPT1' };
+test('converts minor units without multiplying the customer charge',() => expect(providerAmount(5000)).toBe(50));
+test.each([0,-100,50,100.5,'5000',NaN])('rejects unsafe or fractional-KES amount %s',(v) => expect(() => providerAmount(v)).toThrow());
+test.each(['http://backend.payhero.co.ke','https://backend.payhero.co.ke.evil.test','https://user:password@backend.payhero.co.ke','https://backend.payhero.co.ke/api/v2','https://127.0.0.1','https://backend.payhero.co.ke?key=abc'])('rejects unapproved provider origin %s',(url) => expect(() => providerOrigin(url)).toThrow());
+test('requires explicit approval for a sandbox host',() => { process.env.PAYHERO_ALLOWED_HOSTS = 'sandbox.example.test'; expect(providerOrigin('https://sandbox.example.test')).toBe('https://sandbox.example.test'); delete process.env.PAYHERO_ALLOWED_HOSTS; });
+test.each(['http://billing.example.com','https://localhost','https://127.0.0.1:8443','https://billing.example.com/path','https://billing.example.com?token=x'])('rejects an invalid callback origin %s',(url) => expect(() => callbackOrigin(url)).toThrow());
+test('parses only bounded callback evidence and normalizes the phone',() => { expect(callback).toEqual({ amount_minor: 5000,external_reference: 'PH-test',checkout_id: 'checkout-id',receipt: 'RECEIPT1',phone: '+254712345678',result_code: 0 }); expect(parsePayHeroCallback({ response: { Amount: '50.001' } }).amount_minor).toBeNull(); });
+test('queued response is pending, never proof of payment',() => expect(checkPaymentEvidence({ ...evidence,status: 'QUEUED' },callback,attempt,purchase,config).state).toBe('pending'));
+test('success needs both a provider result and callback evidence',() => { expect(checkPaymentEvidence(evidence,undefined,attempt,purchase,config).state).toBe('pending'); expect(checkPaymentEvidence(evidence,callback,attempt,purchase,config).state).toBe('succeeded'); });
+test.each([{ amount_minor: 4900 },{ phone: '+254712345679' },{ external_reference: 'other' },{ checkout_id: 'other' },{ receipt: 'other' },{ result_code: 1 }])('mismatched callback evidence requires review %#',(change) => expect(checkPaymentEvidence(evidence,{ ...callback,...change },attempt,purchase,config).state).toBe('review'));
+test.each([{ reference: 'other' },{ provider: 'sasapay' },{ amount: 5000 },{ currency: 'USD' },{ channel_id: 4 },{ account_id: 3 },{ CheckoutRequestID: 'other' },{ success: false },{ provider_reference: 'other' }])('mismatched provider evidence requires review %#',(change) => expect(checkPaymentEvidence({ ...evidence,...change },callback,attempt,purchase,config).state).toBe('review'));
+test('authenticated failure can finish an attempt without granting access',() => expect(checkPaymentEvidence({ ...evidence,status: 'FAILED',success: false },undefined,attempt,purchase,config).state).toBe('failed'));
+test('transport sends backend Basic auth and disables redirects',async () => {
+  const transport = jest.fn(async () => new Response(JSON.stringify({ success: true }),{ status: 201 }));
+  await payHeroRequest(config,{ username: 'test-api',password: 'test-secret' },'payments',{ amount: 50 },transport as Transport);
+  expect(transport).toHaveBeenCalledTimes(1);
+  const options = (transport.mock.calls as unknown as [string,RequestInit][])[0][1];
+  expect(options.redirect).toBe('error'); expect(options.headers).toMatchObject({ Authorization: `Basic ${Buffer.from('test-api:test-secret').toString('base64')}` });
+});
+test('a transport timeout is never automatically retried',async () => { const transport = jest.fn(async () => { throw new Error('timeout'); }); await expect(payHeroRequest(config,{ username: 'a',password: 'b' },'payments',{},transport as Transport)).rejects.toThrow(); expect(transport).toHaveBeenCalledTimes(1); });
+test('oversized provider response is rejected',async () => { const transport = async () => new Response('x'.repeat(131073)); await expect(payHeroRequest(config,{ username: 'a',password: 'b' },'payments',{},transport as Transport)).rejects.toThrow('limit'); });

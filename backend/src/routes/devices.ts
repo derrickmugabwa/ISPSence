@@ -1,0 +1,3845 @@
+import { resolveAuth } from '../services/sshExec';
+import { readSshInfo, refreshOverSsh, checkApi, promoteToApi, recordApiCheck, type SshOnlyDevice } from '../services/sshOnly';
+import { describeSshFailure } from '../utils/sshOnly';
+import net from 'net';
+import { Router, Request, Response } from 'express';
+import { deviceSiteAccess, deviceIdParam, devicesDenied } from '../utils/siteAccess';
+import { bulkUpdateCredentials } from '../services/bulkCredentials';
+import { deviceSettings } from '../services/pollSettings';
+import { validateOverrides } from '../utils/pollOverrides';
+import { devicePins, pendingIdentityChanges, trustNewIdentity, IDENTITY_KINDS } from '../services/identityPins';
+import { enableApiSsl, type ApiSslDevice } from '../services/apiSsl';
+import { enableWwwSsl } from '../services/wwwSsl';
+import { deviceWriteLock, deviceIdFromPath } from '../services/changeGuard/deviceLock';
+import { randomUUID } from 'crypto';
+import { Client as SshClient } from 'ssh2';
+import { query, queryOne } from '../config/database';
+import { requireAuth, requireWrite, requireAdmin, requireSiteAdmin, isSiteScoped } from '../middleware/auth';
+import { maskSecretsForReadOnly } from '../utils/redactSecrets';
+import { encrypt, decrypt } from '../utils/crypto';
+import { RouterOSClient } from '../services/mikrotik/RouterOSClient';
+import { usesApiTls, managementService, parseApiTls, checkPort } from '../utils/apiTls';
+import { planBridgePortMove, addressesOnPorts, bridgeDeleteRefusal } from '../utils/bridgePortMove';
+import { DeviceCollector, DeviceRow } from '../services/mikrotik/DeviceCollector';
+import { PollerService } from '../services/PollerService';
+import { createDeviceFromBody, loadCredentialPreset, type CreateDeviceInput } from '../services/deviceCreation';
+import { parsePort } from '../utils/parsePort';
+import { safeConnectionError } from '../utils/safeClientError';
+import { normalizeDeviceAddress, reconcileAddressPort } from '../utils/deviceAddress';
+import { withSafeApply, probeCapability, probeUndoCapability, GuardRequiredError, type GuardDevice } from '../services/changeGuard/ChangeGuard';
+import { captureSnapshot, resolveManagementPath } from '../services/changeGuard/pathModel';
+import { analyzeChange, type PlannedChange } from '../services/changeGuard/analyzeChange';
+import { runConfigHealth } from '../services/changeGuard/configHealth';
+import { fixFor, noFixReason } from '../utils/configHealthFixes';
+import { expandVlanIds } from '../utils/vlan';
+import { isMultiVlanSpec } from '../utils/vlan';
+import { redis } from '../config/redis';
+import { enqueueBulkAddJob, getBulkAddJobState } from '../services/DeviceBulkAddWorker';
+import { logSafe } from '../utils/logSafe';
+import { withGuardedChange } from '../services/changeGuard/guardedRoute';
+import { updateAvailable } from '../utils/rosVersion';
+import { DEVICE_BASE_COLUMNS } from '../services/deviceColumns';
+import { withEffectiveLocation } from '../services/deviceLocation';
+import { SSH_TARGET_COLS } from '../services/SshKeyService';
+import { classifyKeyTarget } from '../utils/sshKeyCredentials';
+import type { HealthIssue } from '../utils/deviceHealth';
+import { runHealthCheck } from '../services/healthCheck';
+import { buildSegments, summarise, summariseBands } from '../utils/lteDwell';
+import { siteScopeDevices, andSite } from '../utils/siteScope';
+import { activeSite, targetSite } from '../middleware/site';
+
+/** Postgres interval text to milliseconds, for the few windows we offer. */
+function intervalToMs(interval: string): number {
+  const [n, unit] = interval.split(' ');
+  const per: Record<string, number> = { hours: 3_600_000, days: 86_400_000 };
+  return (Number(n) || 0) * (per[unit] ?? 0);
+}
+import { parseBandList, uplinkAnchor, totalBandwidthMhz, type LteBandInfo } from '../utils/lte';
+import { fluxString } from '@influxdata/influxdb-client';
+import { upgradeDecision } from '../utils/firmwarePlan';
+import { sshHostCheck, explainSshError } from '../services/sshHostCheck';
+import { presetCaller } from '../utils/presetAccess';
+import { parseAllowedList, configuredServices, allowedFromKey, managerPeer, addressAllowed, plainApiUsers } from '../utils/ipServices';
+import { portErrorSummaries, thresholds } from '../services/interfaceErrors';
+import { clientAddressListView } from '../utils/addressLists';
+import { l3hwView } from '../utils/l3hw';
+import { switchVlanView } from '../utils/switchVlans';
+import { opticStatuses, opticHistory, dropThreshold, rxLimits } from '../services/opticLevels';
+
+const router = Router();
+router.use(requireAuth);
+// A site-scoped account only reaches devices in its own sites, with its role there (P1-7).
+router.use(deviceSiteAccess(deviceIdParam));
+
+// The :id a handler acts on must be the plain number the site check read
+// (GHSA-6xq3-q9m5-7hxp); anything else is answered as not found.
+router.param('id', (_req, res, next, id) => {
+  if (!/^\d{1,10}$/.test(String(id))) { res.status(404).json({ error: 'Device not found' }); return; }
+  next();
+});
+// Viewers and read-only tokens never receive device secrets (Wi-Fi keys,
+// WireGuard private keys, SNMP communities, hotspot passwords).
+router.use(maskSecretsForReadOnly);
+// One write at a time per device, so a Change Guard revert can't undo another write.
+router.use(deviceWriteLock(deviceIdFromPath));
+
+let pollerService: PollerService | null = null;
+export function setPollerService(p: PollerService): void {
+  pollerService = p;
+}
+
+// GET /api/devices
+router.get('/', async (req: Request, res: Response) => {
+  const where = andSite('', siteScopeDevices(activeSite(req)));
+  const devices = await query(
+    `SELECT ${DEVICE_BASE_COLUMNS},
+            latest_ros_version, firmware_update_available,
+            routerboard_upgrade_available, upgrade_firmware_version,
+            location_address, location_lat::float8 AS location_lat, location_lng::float8 AS location_lng,
+            rack_name, rack_slot, wifi_role, created_at
+     FROM devices ${where} ORDER BY name ASC`
+  );
+
+  // How the manager logs in (#199): a stored password, and an SSH key it has
+  // verified (the only state in which SSH uses the key). Asked separately so
+  // the device payload query never names a credential column.
+  const loginRows = await query<{ id: number; has_password: boolean; has_ssh_key: boolean }>(
+    `SELECT id, (COALESCE(api_password_encrypted, '') <> '') AS has_password,
+            EXISTS (SELECT 1 FROM device_ssh_keys k WHERE k.device_id = devices.id AND k.status = 'verified') AS has_ssh_key
+     FROM devices ${where}`
+  );
+  const loginById = new Map(loginRows.map((r) => [r.id, r]));
+
+  // Attach tags to each device
+  const tagRows = await query<{ device_id: number; id: number; name: string; color: string }>(
+    `SELECT dt.device_id, t.id, t.name, t.color
+     FROM device_tags dt JOIN tags t ON t.id = dt.tag_id`
+  );
+  const tagsByDevice: Record<number, { id: number; name: string; color: string }[]> = {};
+  for (const t of tagRows) {
+    if (!tagsByDevice[t.device_id]) tagsByDevice[t.device_id] = [];
+    tagsByDevice[t.device_id].push({ id: t.id, name: t.name, color: t.color });
+  }
+  const result = (devices as { id: number; site_id: number | null }[]).map((d) => ({
+    ...d,
+    tags: tagsByDevice[d.id] ?? [],
+    has_password: loginById.get(d.id)?.has_password ?? true,
+    has_ssh_key: loginById.get(d.id)?.has_ssh_key ?? false,
+  }));
+
+  res.json(await withEffectiveLocation(result));
+});
+
+// ─── Routers overview (router-type devices with route counts) ─────────────────
+router.get('/routers/overview', async (req: Request, res: Response) => {
+  const siteFilter = siteScopeDevices(activeSite(req), 'd');
+  const routers = await query(`
+    SELECT d.id, d.name, d.ip_address, d.model, d.device_type, d.status, d.last_seen,
+           d.ros_version, d.firmware_version, d.serial_number, d.rack_name, d.rack_slot,
+           COUNT(i.id) FILTER (WHERE i.running = true  AND i.disabled = false) AS ifaces_up,
+           COUNT(i.id) FILTER (WHERE i.running = false AND i.disabled = false) AS ifaces_down,
+           COUNT(i.id) FILTER (WHERE i.disabled = true)                        AS ifaces_disabled,
+           COUNT(i.id)                                                          AS ifaces_total
+    FROM devices d
+    LEFT JOIN interfaces i ON i.device_id = d.id
+      AND (i.type ILIKE 'ether%' OR i.type ILIKE 'sfp%'
+           OR i.name ILIKE 'ether%' OR i.name ILIKE 'sfp%')
+    WHERE d.device_type = 'router' ${siteFilter ? `AND ${siteFilter}` : ''}
+    GROUP BY d.id
+    ORDER BY d.name ASC
+  `);
+  res.json(routers);
+});
+
+// ─── Security check suppressions (issue #101) ────────────────────────────────
+
+/**
+ * A posture check the operator has judged inapplicable — cleartext API on a fleet
+ * reachable only over WireGuard, or a missing input firewall on a switch that sits
+ * behind one. Suppressed checks stay visible and marked; they simply stop counting
+ * against the score, so the posture remains auditable.
+ *
+ * `device_id` omitted suppresses fleet-wide; supplying one silences that device only.
+ */
+router.get('/security/suppressions', async (_req: Request, res: Response) => {
+  const rows = await query(`
+    SELECT s.id, s.check_id, s.device_id, s.reason, s.created_by, s.created_at,
+           d.name AS device_name
+    FROM security_check_suppressions s
+    LEFT JOIN devices d ON d.id = s.device_id
+    ORDER BY s.check_id, d.name NULLS FIRST`);
+  res.json(rows);
+});
+
+router.post('/security/suppressions', requireWrite, async (req: Request, res: Response) => {
+  const { check_id, device_id, reason } = req.body as
+    { check_id?: string; device_id?: number | null; reason?: string };
+  if (!check_id) return res.status(400).json({ error: 'check_id is required' });
+
+  const rows = await query(
+    `INSERT INTO security_check_suppressions (check_id, device_id, reason, created_by)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT DO NOTHING
+     RETURNING *`,
+    [check_id, device_id ?? null, reason ?? null,
+     (req as unknown as { user?: { username?: string } }).user?.username ?? null]
+  );
+  // ON CONFLICT DO NOTHING returns no row when it already existed, which is not an
+  // error — the caller asked for a state that now holds either way.
+  res.status(201).json(rows[0] ?? { check_id, device_id: device_id ?? null, already: true });
+});
+
+router.delete('/security/suppressions/:id', requireWrite, async (req: Request, res: Response) => {
+  await query(`DELETE FROM security_check_suppressions WHERE id = $1`, [req.params.id]);
+  res.status(204).end();
+});
+
+// GET /api/devices/discovered — unresolved MikroTik neighbors from topology_links
+router.get('/discovered', async (_req: Request, res: Response) => {
+  const rows = await query<{
+    neighbor_identity: string | null;
+    neighbor_address: string | null;
+    neighbor_mac: string | null;
+    neighbor_platform: string | null;
+    discovered_at: string;
+    seen_by: string;
+  }>(`
+    SELECT tl.neighbor_identity,
+           COALESCE(NULLIF(tl.neighbor_address, ''), c.ip_address) AS neighbor_address,
+           tl.neighbor_mac,
+           tl.neighbor_platform, tl.discovered_at, d.name AS seen_by
+    FROM topology_links tl
+    JOIN devices d ON d.id = tl.from_device_id
+    LEFT JOIN clients c ON LOWER(c.mac_address) = LOWER(tl.neighbor_mac)
+                        AND c.ip_address IS NOT NULL AND c.ip_address != ''
+    WHERE tl.to_device_id IS NULL
+      AND tl.neighbor_platform ILIKE '%mikrotik%'
+      AND (tl.neighbor_address IS NULL OR tl.neighbor_address = '' OR tl.neighbor_address NOT LIKE '%:%')
+    ORDER BY tl.discovered_at DESC
+  `);
+
+  // Build lookup tables for "is this actually a managed device we already know?"
+  // We match a discovered neighbor to a managed device by any of:
+  //   - its MAC matching any interface MAC of a managed device,
+  //   - its IP matching the managed device's primary ip_address,
+  //   - its identity matching the managed device's name.
+  const [managedByMac, managedByIp, managedByName] = await Promise.all([
+    query<{ device_id: number; device_name: string; mac: string }>(
+      `SELECT i.device_id AS device_id, d.name AS device_name, LOWER(i.mac_address) AS mac
+         FROM interfaces i
+         JOIN devices d ON d.id = i.device_id
+        WHERE i.mac_address IS NOT NULL AND i.mac_address <> ''`
+    ),
+    query<{ id: number; name: string; ip_address: string }>(
+      `SELECT id, name, ip_address FROM devices WHERE ip_address IS NOT NULL AND ip_address <> ''`
+    ),
+    query<{ id: number; name: string }>(
+      `SELECT id, name FROM devices WHERE name IS NOT NULL AND name <> ''`
+    ),
+  ]);
+  const macToDevice = new Map<string, { id: number; name: string }>();
+  for (const r of managedByMac) macToDevice.set(r.mac, { id: r.device_id, name: r.device_name });
+  const ipToDevice = new Map<string, { id: number; name: string }>();
+  for (const r of managedByIp) ipToDevice.set(r.ip_address, { id: r.id, name: r.name });
+  const nameToDevice = new Map<string, { id: number; name: string }>();
+  for (const r of managedByName) nameToDevice.set(r.name.toLowerCase(), { id: r.id, name: r.name });
+
+  // Deduplicate across all three identifiers so that a neighbor seen by multiple managed
+  // devices — some via LLDP (has MAC), others via MNDP (no MAC) — merges into one entry.
+  // Three indexes cross-reference mac/ip/identity to the canonical dedup key.
+  const seen = new Map<string, typeof rows[0] & { seen_by_list: string[] }>();
+  const macIdx = new Map<string, string>();      // normalised-mac  → canonical key
+  const ipIdx  = new Map<string, string>();      // ip              → canonical key
+  const nameIdx = new Map<string, string>();     // lower-identity  → canonical key
+
+  for (const row of rows) {
+    const mac      = (row.neighbor_mac  || '').toLowerCase();
+    const ip       = row.neighbor_address || '';
+    const identity = (row.neighbor_identity || '').toLowerCase();
+
+    // Find whether any identifier matches something already in the map
+    const existingKey =
+      (mac      && macIdx.get(mac))   ||
+      (ip       && ipIdx.get(ip))     ||
+      (identity && nameIdx.get(identity));
+
+    if (existingKey) {
+      const existing = seen.get(existingKey)!;
+      if (row.seen_by && !existing.seen_by_list.includes(row.seen_by)) {
+        existing.seen_by_list.push(row.seen_by);
+      }
+      // Register any newly-learned identifiers against the same key
+      if (mac      && !macIdx.has(mac))       macIdx.set(mac,      existingKey);
+      if (ip       && !ipIdx.has(ip))          ipIdx.set(ip,        existingKey);
+      if (identity && !nameIdx.has(identity)) nameIdx.set(identity, existingKey);
+    } else {
+      const key = mac || ip || identity;
+      if (!key) continue;
+      seen.set(key, { ...row, seen_by_list: row.seen_by ? [row.seen_by] : [] });
+      if (mac)      macIdx.set(mac,      key);
+      if (ip)       ipIdx.set(ip,        key);
+      if (identity) nameIdx.set(identity, key);
+    }
+  }
+
+  const results = Array.from(seen.values()).map((r) => {
+    const mac = (r.neighbor_mac || '').toLowerCase();
+    const match =
+      (mac && macToDevice.get(mac)) ||
+      (r.neighbor_address && ipToDevice.get(r.neighbor_address)) ||
+      (r.neighbor_identity && nameToDevice.get(r.neighbor_identity.toLowerCase())) ||
+      null;
+    return {
+      identity: r.neighbor_identity || '',
+      address: r.neighbor_address || '',
+      mac_address: r.neighbor_mac || '',
+      platform: r.neighbor_platform || '',
+      discovered_at: r.discovered_at,
+      seen_by: r.seen_by_list.join(', '),
+      duplicate_of_device_id: match ? match.id : null,
+      duplicate_of_device_name: match ? match.name : null,
+    };
+  });
+
+  res.json(results);
+});
+
+// POST /api/devices
+router.post('/', requireWrite, async (req: Request, res: Response) => {
+  // A device added while viewing a site joins that site (issue #130); a
+  // site-scoped account can only add to its own sites (P1-7).
+  const target = targetSite(req);
+  if (!target.ok) return res.status(target.status).json({ error: target.error });
+  const result = await createDeviceFromBody(req.body, pollerService, {
+    // Admin-only credential presets are fleet objects: a site admin uses them as an operator would (P1-7).
+    requestingUserRole: isSiteScoped(req.user) ? 'operator' : req.user?.role,
+    presetCaller: presetCaller(req.user),
+    siteId: target.siteId,
+    allowedSites: req.user?.siteRoles ? Object.keys(req.user.siteRoles).map(Number) : null,
+  });
+  return res.status(result.status).json(result.body);
+});
+
+const BULK_ADD_META_TTL_SEC = 86400;
+
+// POST /api/devices/credentials/bulk — change the login the manager uses for
+// several devices (#259). Each device is logged in to with the new login first
+// and only updated if that works. The devices themselves are not changed.
+router.post('/credentials/bulk', requireWrite, async (req: Request, res: Response) => {
+  const ids = Array.isArray(req.body?.device_ids) ? (req.body.device_ids as unknown[]).map(Number) : [];
+  if (ids.length === 0 || ids.length > 500 || !ids.every((n) => Number.isSafeInteger(n) && n > 0)) {
+    return res.status(400).json({ error: 'device_ids must be a list of up to 500 device ids.' });
+  }
+  const presetId = req.body?.credential_preset_id == null ? null : Number(req.body.credential_preset_id);
+  if (presetId !== null && (!Number.isSafeInteger(presetId) || presetId <= 0)) {
+    return res.status(400).json({ error: 'credential_preset_id must be a preset id.' });
+  }
+  const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
+  const input = {
+    credential_preset_id: presetId,
+    api_username: str(req.body?.api_username)?.trim(),
+    api_password: str(req.body?.api_password),
+    ssh_username: req.body?.ssh_username === undefined ? undefined : (str(req.body.ssh_username)?.trim() || null),
+    ssh_password: req.body?.ssh_password === undefined ? undefined : (str(req.body.ssh_password) || null),
+  };
+  if (presetId === null && (!input.api_username || !input.api_password)) {
+    return res.status(400).json({ error: 'Pick a preset, or give both a username and a password.' });
+  }
+  // Every device must be one the account may change; one outside its sites
+  // refuses the lot rather than quietly skipping it.
+  const denied = await devicesDenied(req.user!, ids, 'operator');
+  if (denied.length) return res.status(404).json({ error: `Device${denied.length === 1 ? '' : 's'} not found: ${denied.join(', ')}` });
+
+  const results = await bulkUpdateCredentials(ids, input, { role: req.user?.role, presetCaller: presetCaller(req.user) });
+  return res.json({ results, updated: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length });
+});
+
+// POST /api/devices/bulk-add/jobs — enqueue Try-All style adds (survives tab close)
+router.post('/bulk-add/jobs', requireWrite, async (req: Request, res: Response) => {
+  const bulkTarget = targetSite(req);
+  if (!bulkTarget.ok) return res.status(bulkTarget.status).json({ error: bulkTarget.error });
+  const { items } = req.body as { items?: unknown };
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'items must be a non-empty array' });
+  }
+  if (items.length > 500) {
+    return res.status(400).json({ error: 'items array exceeds maximum of 500' });
+  }
+  const jobId = randomUUID();
+  const ownerUserId = req.user!.userId;
+  await redis.set(
+    `device-bulk-add:${jobId}:meta`,
+    JSON.stringify({
+      status: 'queued',
+      total: items.length,
+      processed: 0,
+      owner_user_id: ownerUserId,
+      created_at: new Date().toISOString(),
+    }),
+    'EX',
+    BULK_ADD_META_TTL_SEC
+  );
+  await redis.set(`device-bulk-add:${jobId}:results`, '[]', 'EX', BULK_ADD_META_TTL_SEC);
+  await enqueueBulkAddJob(jobId, items as CreateDeviceInput[], bulkTarget.siteId, isSiteScoped(req.user) ? 'operator' : req.user!.role,
+    req.user?.siteRoles ? Object.keys(req.user.siteRoles).map(Number) : null, presetCaller(req.user));
+  return res.status(202).json({ job_id: jobId, total: items.length });
+});
+
+// POST /api/devices/bulk-add/jobs/:jobId/cancel — request cooperative cancel
+router.post('/bulk-add/jobs/:jobId/cancel', requireWrite, async (req: Request, res: Response) => {
+  const state = await getBulkAddJobState(req.params.jobId);
+  if (!state.found) {
+    return res.status(404).json({ error: 'Job not found or expired' });
+  }
+  const ownerId = state.meta.owner_user_id;
+  if (typeof ownerId !== 'number' || ownerId !== req.user!.userId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  await redis.set(`device-bulk-add:${req.params.jobId}:cancel`, '1', 'EX', BULK_ADD_META_TTL_SEC);
+  return res.json({ message: 'Cancel requested' });
+});
+
+// GET /api/devices/bulk-add/jobs/:jobId — poll job status and incremental results
+router.get('/bulk-add/jobs/:jobId', requireWrite, async (req: Request, res: Response) => {
+  const state = await getBulkAddJobState(req.params.jobId);
+  if (!state.found) {
+    return res.status(404).json({ error: 'Job not found or expired' });
+  }
+  const ownerId = state.meta.owner_user_id;
+  if (typeof ownerId !== 'number' || ownerId !== req.user!.userId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  return res.json({
+    job_id: req.params.jobId,
+    ...state.meta,
+    results: state.results,
+  });
+});
+
+// GET /api/devices/:id
+router.get('/:id', async (req: Request, res: Response) => {
+  const device = await queryOne(
+    `SELECT ${DEVICE_BASE_COLUMNS},
+            ssh_port, ssh_username, latest_ros_version,
+            firmware_update_available, routerboard_upgrade_available, upgrade_firmware_version,
+            location_address,
+            location_lat::float8 AS location_lat,
+            location_lng::float8 AS location_lng,
+            rack_name, rack_slot, wifi_role, has_lte, user_manager, created_at, updated_at
+     FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+  const [withLoc] = await withEffectiveLocation([device as { site_id: number | null }]);
+  return res.json(withLoc);
+});
+
+// PATCH /api/devices/:id/monitoring — health and intermittent settings (#168)
+//   intermittent: expected to drop out (solar, battery); no alert per outage
+//   intermittent_alert_after_min: alert once if offline longer (0 = never)
+//   health_ignored: /system/health readings this device is not judged on
+router.patch('/:id/monitoring', requireWrite, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    intermittent?: unknown; intermittent_alert_after_min?: unknown; health_ignored?: unknown;
+  };
+  const sets: string[] = [];
+  const params: unknown[] = [req.params.id];
+  if (body.intermittent !== undefined) {
+    if (typeof body.intermittent !== 'boolean') return res.status(400).json({ error: 'intermittent must be true or false' });
+    params.push(body.intermittent); sets.push(`intermittent = $${params.length}`);
+    // Turning it off must not leave a stale "already alerted" mark behind.
+    if (!body.intermittent) sets.push('intermittent_alerted_at = NULL');
+  }
+  if (body.intermittent_alert_after_min !== undefined) {
+    const n = Number(body.intermittent_alert_after_min);
+    if (!Number.isInteger(n) || n < 0 || n > 60 * 24 * 90) {
+      return res.status(400).json({ error: 'intermittent_alert_after_min must be 0 (never) to 129600 minutes' });
+    }
+    params.push(n); sets.push(`intermittent_alert_after_min = $${params.length}`);
+  }
+  if (body.health_ignored !== undefined) {
+    const list = Array.isArray(body.health_ignored) ? body.health_ignored.map(String) : null;
+    if (!list || list.some((x) => !/^[a-z0-9-]{1,64}$/.test(x))) {
+      return res.status(400).json({ error: 'health_ignored must be a list of health reading names' });
+    }
+    params.push([...new Set(list)]); sets.push(`health_ignored = $${params.length}::text[]`);
+  }
+  if (!sets.length) return res.status(400).json({ error: 'Nothing to change' });
+  const [row] = await query(
+    `UPDATE devices SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $1
+     RETURNING id, intermittent, intermittent_alert_after_min, health_ignored`,
+    params
+  );
+  if (!row) return res.status(404).json({ error: 'Device not found' });
+
+  // Re-sort the stored problems under the new ignore list now, rather than
+  // leaving the device amber until the next slow poll.
+  if (body.health_ignored !== undefined) {
+    const [cur] = await query<{ health_status: string | null; health_issues: { issues?: HealthIssue[]; ignored?: HealthIssue[] } | null }>(
+      `SELECT health_status, health_issues FROM devices WHERE id = $1`, [req.params.id]
+    );
+    if (cur?.health_issues && cur.health_status !== 'unknown') {
+      const all = [...(cur.health_issues.issues ?? []), ...(cur.health_issues.ignored ?? [])];
+      const ignore = new Set((row as { health_ignored: string[] }).health_ignored);
+      const issues = all.filter((i) => !ignore.has(i.item));
+      const ignored = all.filter((i) => ignore.has(i.item));
+      await query(
+        `UPDATE devices SET health_status = $2, health_issues = $3 WHERE id = $1`,
+        [req.params.id, issues.length ? 'degraded' : 'ok', JSON.stringify({ issues, ignored })]
+      );
+    }
+  }
+  return res.json(row);
+});
+
+// PATCH /api/devices/:id/location — save physical location & rack info
+router.patch('/:id/location', requireWrite, async (req: Request, res: Response) => {
+  const existing = await queryOne(`SELECT id FROM devices WHERE id = $1`, [req.params.id]);
+  if (!existing) return res.status(404).json({ error: 'Device not found' });
+
+  // Only the fields sent are changed (outside review C2). Every omitted field
+  // used to be set to null, so saving just the rack erased the coordinates
+  // and notes. Sending a field as null still clears it.
+  const fields = ['location_address', 'location_lat', 'location_lng', 'rack_name', 'rack_slot', 'notes'] as const;
+  const body = req.body as Record<string, unknown>;
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  for (const f of fields) {
+    if (!Object.prototype.hasOwnProperty.call(body, f)) continue;
+    params.push(new Map(Object.entries(body)).get(f) ?? null);
+    sets.push(`${f} = $${params.length}`);
+  }
+  if (sets.length > 0) {
+    params.push(req.params.id);
+    // Column names come from the fixed list above.
+    await query(`UPDATE devices SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`, params);
+  }
+
+  const updated = await queryOne(
+    `SELECT ${DEVICE_BASE_COLUMNS},
+            ssh_port, ssh_username, location_address,
+            location_lat::float8 AS location_lat,
+            location_lng::float8 AS location_lng,
+            rack_name, rack_slot, wifi_role, has_lte, user_manager, created_at, updated_at
+     FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  const [withLoc] = await withEffectiveLocation([updated as { site_id: number | null }]);
+  return res.json(withLoc);
+});
+
+// PUT /api/devices/:id
+router.put('/:id', requireWrite, async (req: Request, res: Response) => {
+  const {
+    name, ip_address: rawIpAddress, device_type, notes, credential_preset_id,
+    unlock_name,
+  } = req.body as {
+    name?: string;
+    ip_address?: string;
+    device_type?: string;
+    notes?: string;
+    credential_preset_id?: number | null;
+    /** "Use the router's identity" in Edit Device — see name_locked below. */
+    unlock_name?: boolean;
+  };
+
+  // Accepts an IPv4/IPv6 literal or a hostname, same as device creation.
+  let ip_address: string | undefined;
+  let addressPort: number | undefined;
+  if (typeof rawIpAddress === 'string' && rawIpAddress) {
+    const normalized = normalizeDeviceAddress(rawIpAddress);
+    if (!normalized.ok) return res.status(400).json({ error: normalized.reason });
+    ip_address = normalized.address;
+    addressPort = normalized.port;
+  }
+
+  const existing = await queryOne<{
+    id: number;
+    name: string;
+    ip_address: string;
+    api_port: number;
+    api_tls: boolean | null;
+    api_username: string;
+    api_password_encrypted: string;
+    ssh_port: number | null;
+    site_id: number | null;
+    ssh_only: boolean;
+    ssh_username: string | null;
+    ssh_password_encrypted: string | null;
+  }>(
+    `SELECT id, name, ip_address, api_port, api_tls, api_username, api_password_encrypted, ssh_port, site_id,
+            ssh_only, ssh_username, ssh_password_encrypted
+       FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!existing) return res.status(404).json({ error: 'Device not found' });
+
+  // name_locked: false only on an explicit "use the router's identity" request
+  // (unlock_name, sent alone); true the moment a rename is actually given here
+  // (Edit Device is a deliberate action, unlike the placeholder names CSV
+  // import/Try All fall back to); otherwise left untouched (COALESCE below) —
+  // e.g. saving the form again without touching the name must not re-lock it.
+  const nameLockedUpdate: boolean | null =
+    unlock_name === true
+      ? false
+      : (typeof name === 'string' && name && name !== existing.name) ? true : null;
+
+  let preset: Awaited<ReturnType<typeof loadCredentialPreset>>;
+  try {
+    // The same rules as adding (#228): a site's preset only on that site's
+    // devices, and admin-only fleet presets kept from site admins (P1-7). Here
+    // the role had been the device's site role, which let a site admin apply
+    // an admin-only fleet preset by editing a device.
+    preset = await loadCredentialPreset(credential_preset_id ?? null, {
+      requestingUserRole: req.user?.role,
+      presetCaller: presetCaller(req.user),
+    }, existing.site_id ?? null);
+  } catch (err) {
+    const status = (err as Error & { statusCode?: number }).statusCode ?? 400;
+    return res.status(status).json({ error: (err as Error).message });
+  }
+
+  // Out-of-range ports used to be stored as given (#257).
+  for (const [field, label] of [['api_port', 'API port'], ['ssh_port', 'SSH port']] as const) {
+    const pc = checkPort(req.body[field], label);
+    if (!pc.ok) return res.status(400).json({ error: pc.error });
+  }
+
+  // When a preset is applied, its values take precedence over anything else
+  // in the body so "apply preset" has a single unambiguous meaning.
+  const portCheck = reconcileAddressPort(addressPort, preset?.api_port ?? req.body.api_port);
+  if (!portCheck.ok) return res.status(400).json({ error: portCheck.reason });
+  const api_port = portCheck.port ?? preset?.api_port ?? parsePort(req.body.api_port, existing.api_port);
+  const api_username = preset?.api_username ?? req.body.api_username;
+  const api_password = preset?.api_password ?? req.body.api_password;
+  const ssh_port = preset?.ssh_port ?? parsePort(req.body.ssh_port, existing.ssh_port ?? 22);
+  const ssh_username = preset ? preset.ssh_username : req.body.ssh_username;
+  const ssh_password = preset ? preset.ssh_password : req.body.ssh_password;
+
+  // An empty username was stored as given and broke every later login, while
+  // the save reported success (outside review C1).
+  if (typeof api_username === 'string' && api_username.trim() === '') {
+    return res.status(400).json({ error: 'The API username cannot be empty.' });
+  }
+
+  // If the user is changing the IP (or port / username / password), verify the
+  // RouterOS API is still reachable with the new values before persisting —
+  // otherwise we could silently brick the device record.
+  const ipChanged = typeof ip_address === 'string' && ip_address && ip_address !== existing.ip_address;
+  const portChanged = typeof api_port === 'number' && api_port !== existing.api_port;
+  // api-ssl on any port (#257): an explicit choice is kept; a new port without
+  // one goes back to the default for that port (TLS on 8729).
+  const api_tls: boolean | null = Object.prototype.hasOwnProperty.call(req.body, 'api_tls')
+    ? parseApiTls(req.body.api_tls)
+    : portChanged ? null : existing.api_tls;
+  const tlsChanged = usesApiTls({ api_port, api_tls }) !== usesApiTls(existing);
+  const userChanged = typeof api_username === 'string' && api_username && api_username !== existing.api_username;
+  const presetReplacesApiCreds = !!preset;
+
+  // Verifying a new address means logging in there, and the RouterOS API login
+  // sends the password in the clear. With the stored password, anyone who could
+  // edit a device could point it at a host they run and collect that device's
+  // admin password, which is exactly what encrypting it at rest is meant to
+  // prevent. So a non-admin moving a device must supply the password; admins
+  // already hold full control and may reuse the stored one.
+  // Fleet admins only: this sends the saved password to the new address (P1-6, P1-7).
+  if (ipChanged && !api_password && !presetReplacesApiCreds && (req.user?.role !== 'admin' || isSiteScoped(req.user))) {
+    return res.status(400).json({
+      error: "Enter the device's API password to change its address. The saved password is only sent to the address it was saved for.",
+      code: 'password_required_for_address_change',
+    });
+  }
+
+  // Added over SSH only (#174): there is no API to log in to yet, so a new
+  // address or SSH login is checked over SSH instead.
+  const sshLoginChanged = (typeof ssh_username === 'string' && ssh_username !== '' && ssh_username !== existing.ssh_username)
+    || !!ssh_password || ssh_port !== (existing.ssh_port ?? 22);
+  if (existing.ssh_only && (ipChanged || sshLoginChanged || presetReplacesApiCreds)) {
+    try {
+      await readSshInfo({
+        id: existing.id, name: existing.name,
+        ip_address: ip_address ?? existing.ip_address,
+        ssh_port,
+        ssh_username: ssh_username || existing.ssh_username || existing.api_username,
+        ssh_password_encrypted: ssh_password ? encrypt(ssh_password)
+          : existing.ssh_password_encrypted || existing.api_password_encrypted,
+      });
+    } catch (err) {
+      return res.status(422).json({ error: describeSshFailure(err, ssh_port) });
+    }
+  } else if (!existing.ssh_only && (ipChanged || portChanged || tlsChanged || userChanged || api_password || presetReplacesApiCreds)) {
+    const testIp = ip_address ?? existing.ip_address;
+    const testPort = api_port;
+    const testUser = api_username ?? existing.api_username;
+    const testPass = api_password ? api_password : decrypt(existing.api_password_encrypted);
+    const testClient = new RouterOSClient(testIp, testPort, testUser, testPass, 10_000, 30_000, usesApiTls({ api_port, api_tls }));
+    try {
+      await testClient.connect();
+      testClient.disconnect();
+    } catch (err) {
+      return res.status(422).json({
+        error: safeConnectionError('PUT /devices/:id', err),
+      });
+    }
+  }
+
+  const encPass = api_password ? encrypt(api_password) : existing.api_password_encrypted;
+  const encSshPass = ssh_password ? encrypt(ssh_password) : null;
+  // Applying a preset replaces the SSH login wholesale, including clearing it
+  // when the preset has none (C1). Merging kept the old password with a new
+  // username, a pair that matches no account.
+  const replaceSsh = !!preset;
+
+  await query(
+    `UPDATE devices SET
+       -- "Use the router's identity" switches the name at once to the identity
+       -- last read (#253), rather than leaving the old one until the resync.
+       name=CASE WHEN $2::boolean IS FALSE AND ros_identity IS NOT NULL THEN ros_identity ELSE COALESCE($1,name) END,
+       name_locked=COALESCE($2,name_locked),
+       ip_address=COALESCE($3,ip_address),
+       api_port=COALESCE($4,api_port),
+       api_username=COALESCE($5,api_username), api_password_encrypted=$6,
+       ssh_port=COALESCE($7,ssh_port),
+       ssh_username=CASE WHEN $13 THEN $8 ELSE COALESCE($8,ssh_username) END,
+       ssh_password_encrypted=CASE WHEN $13 THEN $9 ELSE COALESCE($9,ssh_password_encrypted) END,
+       device_type=COALESCE($10,device_type), notes=COALESCE($11,notes),
+       api_tls=$14,
+       updated_at=NOW()
+     WHERE id = $12`,
+    [name, nameLockedUpdate, ip_address, api_port, api_username, encPass, ssh_port, ssh_username, encSshPass, device_type, notes, req.params.id, replaceSsh, api_tls]
+  );
+
+  // Unlocking asks to follow the router's identity again — resync promptly
+  // rather than leaving the old name showing until the next slow poll (up to
+  // 5 minutes away).
+  if (nameLockedUpdate === false && pollerService) {
+    await pollerService.scheduleDeviceSync(Number(req.params.id), 'full');
+  }
+
+  const updated = await queryOne(
+    `SELECT ${DEVICE_BASE_COLUMNS} FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  return res.json(updated);
+});
+
+// DELETE /api/devices/:id
+router.delete('/:id', requireWrite, async (req: Request, res: Response) => {
+  const result = await query(`DELETE FROM devices WHERE id = $1 RETURNING id`, [req.params.id]);
+  if (!result.length) return res.status(404).json({ error: 'Device not found' });
+  return res.json({ message: 'Device deleted' });
+});
+
+// POST /api/devices/:id/sync - run a full resync and wait for it to complete
+router.post('/:id/sync', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(
+    `SELECT * FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  // Without its API yet (#174), a sync is the SSH read the poller does.
+  if (deviceRow.ssh_only) {
+    try {
+      await refreshOverSsh(deviceRow as unknown as SshOnlyDevice);
+      return res.json({ message: 'Read over SSH. The API is not enabled yet, so only the basics are available.' });
+    } catch (err) {
+      return res.status(500).json({ error: `Sync failed: ${describeSshFailure(err, deviceRow.ssh_port ?? 22)}` });
+    }
+  }
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    await collector.collectAll();
+    await runHealthCheck(collector, deviceRow);
+    return res.json({ message: 'Sync completed' });
+  } catch (err) {
+    return res.status(500).json({ error: `Sync failed: ${(err as Error).message}` });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// POST /api/devices/:id/check-api — for a device added over SSH only (#174):
+// does the API answer now? If it does, the device is managed over the API from
+// now on and a full sync starts. The poller checks too, every minute.
+router.post('/:id/check-api', requireWrite, async (req: Request, res: Response) => {
+  const device = await queryOne<SshOnlyDevice & { ssh_only: boolean }>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+  if (!device.ssh_only) return res.json({ api: true, message: 'This device is already managed over the API.' });
+  const check = await checkApi(device);
+  if (!check.ok) {
+    await recordApiCheck(device.id, check.message);
+    return res.json({ api: false, reason: check.message });
+  }
+  await promoteToApi(device, check);
+  if (pollerService) await pollerService.scheduleDeviceSync(device.id, 'full');
+  return res.json({
+    api: true, port: check.port,
+    message: `The API answers on port ${check.port}${usesApiTls({ api_port: check.port, api_tls: device.api_tls }) ? ' (api-ssl)' : ''}. ${device.name.trim()} is now managed over the API; a full sync has started.`,
+  });
+});
+
+// GET /api/devices/:id/interfaces
+router.get('/:id/interfaces', async (req: Request, res: Response) => {
+  const ifaces = await query(
+    `SELECT * FROM interfaces WHERE device_id = $1 ORDER BY name ASC`,
+    [req.params.id]
+  );
+  return res.json(ifaces);
+});
+
+// GET /api/devices/:id/interface-errors
+//
+// Ports with frame errors or link drops in the last hour (#249), with the
+// state used for the yellow/red markers and the thresholds behind it.
+router.get('/:id/interface-errors', async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid device id' });
+  const [summaries, t] = await Promise.all([portErrorSummaries([id]), thresholds()]);
+  return res.json({
+    ports: summaries.get(id) ?? [],
+    errors_per_min: t.errorsPerMin,
+    flaps_per_hour: t.flapsPerHour,
+  });
+});
+
+// GET /api/devices/:id/optics
+//
+// Light levels and temperature of the optics that report them, each against
+// its usual level, for the port markers and the port card.
+router.get('/:id/optics', async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid device id' });
+  const [statuses, dropDb, limits] = await Promise.all([opticStatuses([id]), dropThreshold(), rxLimits()]);
+  return res.json({ ports: statuses.get(id) ?? [], drop_db: dropDb, rx_low_dbm: limits.rxLow, rx_high_dbm: limits.rxHigh });
+});
+
+// GET /api/devices/:id/optics/:port/history?days=7
+router.get('/:id/optics/:port/history', async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid device id' });
+  const days = Math.min(14, Math.max(1, Number(req.query.days) || 7));
+  return res.json(await opticHistory(id, String(req.params.port), days));
+});
+
+// PUT /api/devices/:id/interfaces/:name
+//
+// Anything that can take the link down (disabling it, MTU, FEC, flow control,
+// speed, PoE) runs under Change Guard: disabling is simulated, the rest counts as
+// an unsimulated change to whatever the management path runs through. Only a
+// comment edit skips the guard. These used to run unguarded even though the
+// analyser already modelled interface.disable (outside review P2-8).
+router.put('/:id/interfaces/:name', requireWrite, async (req: Request, res: Response) => {
+  const name = req.params.name;
+  const { disabled, comment, mtu, poe_out, fec_mode, tx_flow_control, rx_flow_control, auto_negotiation, speed } = req.body;
+
+  const changes: PlannedChange[] = [];
+  if (typeof disabled === 'boolean') changes.push({ kind: 'interface.disable', name, disabled });
+  const linkChange = (what: string) => changes.push({ kind: 'path-object.change', name, what });
+  if (typeof mtu === 'number') linkChange('Changing the MTU');
+  if (fec_mode) linkChange('Changing FEC');
+  if (tx_flow_control !== undefined || rx_flow_control !== undefined) linkChange('Changing flow control');
+  if (typeof auto_negotiation === 'boolean') linkChange('Changing speed or auto-negotiation');
+  if (poe_out) linkChange('Changing PoE output');
+
+  const apply = async (collector: DeviceCollector) => {
+    if (typeof disabled === 'boolean') {
+      await collector.setInterfaceEnabled(req.params.name, !disabled);
+    }
+    if (comment !== undefined) {
+      await collector.setInterfaceComment(req.params.name, comment);
+    }
+    if (typeof mtu === 'number' && mtu >= 576 && mtu <= 9216) {
+      await collector.setInterfaceMtu(req.params.name, mtu);
+    }
+    if (poe_out && ['auto-on', 'forced-on', 'off'].includes(poe_out)) {
+      await collector.setPoeOut(req.params.name, poe_out as 'auto-on' | 'forced-on' | 'off');
+    }
+    if (fec_mode && ['clause-74', 'clause-91', 'off'].includes(fec_mode)) {
+      await collector.setFecMode(req.params.name, fec_mode);
+    }
+    if (tx_flow_control !== undefined || rx_flow_control !== undefined) {
+      // Only the direction(s) given; a missing one is left as it is.
+      const ok = (v: unknown) => v === undefined || ['on', 'off', 'auto'].includes(String(v));
+      if (ok(tx_flow_control) && ok(rx_flow_control)) {
+        await collector.setFlowControl(req.params.name, tx_flow_control, rx_flow_control);
+      }
+    }
+    if (typeof auto_negotiation === 'boolean') {
+      await collector.setAutoNegotiation(req.params.name, auto_negotiation, speed);
+    }
+    return { message: 'Interface updated' };
+  };
+
+  if (changes.length === 0) {
+    await withCollector(req.params.id, res, async (c) => {
+      const out = await apply(c);
+      await c.collectInterfaces();
+      return out;
+    });
+    return;
+  }
+  const summary = typeof disabled === 'boolean' && changes.length === 1
+    ? `${disabled ? 'Disable' : 'Enable'} interface ${name}`
+    : `Change interface ${name}`;
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'interface.set', summary, change: changes.length === 1 ? changes[0] : { kind: 'batch', changes } },
+    apply,
+    async (c) => { await c.collectInterfaces(); });
+});
+
+// PUT /api/devices/:id/ports/:name/vlan - configure VLAN for a switch port
+// Guarded: changing a port's PVID or its tagged/untagged membership is one of the
+// most common ways to strand the management VLAN on a switch.
+router.put('/:id/ports/:name/vlan', requireWrite, async (req: Request, res: Response) => {
+  const { pvid, tagged_vlans = [], untagged_vlans = [], mode, replace_tagged } = req.body;
+  if (pvid !== undefined && (typeof pvid !== 'number' || pvid < 1 || pvid > 4094)) {
+    return res.status(400).json({ error: 'pvid must be 1-4094' });
+  }
+  // Optional and explicit. Without it only the PVID and membership change and
+  // frame admission is left alone, which is the pre-0.24.20 behaviour and what
+  // an existing API caller expects.
+  const role = mode === 'access' || mode === 'trunk' ? mode : undefined;
+  // Also opt-in: the tagged list becomes the port's complete tagged set, so
+  // VLANs left out are removed. Only meaningful for a trunk (#165).
+  const replaceTagged = role === 'trunk' && replace_tagged === true;
+
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    {
+      kind: 'port.vlan',
+      summary: `VLAN config on port ${req.params.name} (pvid ${pvid ?? 1}${role ? `, ${role}` : ''})`,
+      change: {
+        kind: 'port.vlan',
+        port: req.params.name,
+        pvid: pvid ?? 1,
+        tagged: tagged_vlans as number[],
+        untagged: untagged_vlans as number[],
+        // Surfaced to the guard: setting frame-types on the management port is
+        // a far bigger change than a PVID edit, and the summary should say so.
+        mode: role,
+        replaceTagged,
+      },
+    },
+    async (c) => {
+      const { notRemoved } = await c.setPortVlanConfig(
+        req.params.name,
+        pvid ?? 1,
+        tagged_vlans as number[],
+        untagged_vlans as number[],
+        role,
+        replaceTagged
+      );
+      return {
+        message: notRemoved.length
+          ? `VLAN configuration applied. Not removed: ${notRemoved.join(', ')} — they share a bridge VLAN row (a range) with VLANs this port keeps. Edit that row under VLANs to remove them.`
+          : 'VLAN configuration applied',
+        not_removed: notRemoved,
+      };
+    },
+    async (c) => { await c.collectVlans(); }
+  );
+});
+
+// GET /api/devices/:id/vlans
+router.get('/:id/vlans', async (req: Request, res: Response) => {
+  const vlans = await query(`SELECT * FROM vlans WHERE device_id = $1 ORDER BY vlan_id ASC`, [req.params.id]);
+  return res.json(vlans);
+});
+
+// GET /api/devices/:id/ports/:name/monitor — live ethernet monitor + SFP DDM
+router.get('/:id/ports/:name/monitor', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<{ id: number; ip_address: string; api_port: number; api_username: string; api_password_encrypted: string }>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow as unknown as DeviceRow);
+  try {
+    await collector.connect();
+    const monitor = await collector.getPortMonitor(req.params.name);
+    return res.json(monitor);
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// GET /api/devices/:id/ports/:name/clients — clients on this port.
+//
+// The bridge FDB lists every MAC *reachable through* a port, so on an
+// uplink/trunk it shows the whole network. We classify the port and, by
+// default, only return clients that are genuinely *physically* connected
+// (a single access VLAN, no infra neighbour, not an aggregation point).
+// Pass ?all=true to get the raw FDB list regardless (the "view MAC table"
+// disclosure in the UI).
+const UPLINK_MAC_THRESHOLD = 8;
+router.get('/:id/ports/:name/clients', async (req: Request, res: Response) => {
+  const all = req.query.all === 'true';
+  const rows = await query<{
+    mac_address: string; hostname: string | null; custom_name: string | null;
+    vendor: string | null; ip_address: string | null; client_type: string;
+    vlan_id: number | null; signal_strength: number | null;
+    first_seen: string | null; last_seen: string | null;
+  }>(`
+    SELECT mac_address, hostname, custom_name, vendor, ip_address, client_type,
+           vlan_id, signal_strength, first_seen, last_seen
+    FROM clients
+    WHERE device_id = $1 AND interface_name = $2 AND active = TRUE
+    ORDER BY COALESCE(NULLIF(custom_name, ''), hostname, mac_address) ASC
+  `, [req.params.id, req.params.name]);
+
+  // A discovered LLDP/MNDP neighbour on this interface means it links to
+  // another managed device → definitively an uplink.
+  const neighbor = await queryOne<{ neighbor_identity: string | null; neighbor_platform: string | null }>(
+    `SELECT neighbor_identity, neighbor_platform FROM topology_links
+     WHERE from_device_id = $1 AND from_interface = $2
+     ORDER BY (neighbor_identity IS NOT NULL) DESC LIMIT 1`,
+    [req.params.id, req.params.name]
+  );
+
+  const macCount = rows.length;
+  const vlanCount = new Set(rows.filter(r => r.vlan_id != null).map(r => r.vlan_id)).size;
+
+  let classification: 'access' | 'uplink' = 'access';
+  let reason = '';
+  if (neighbor) {
+    classification = 'uplink';
+    reason = `Links to ${neighbor.neighbor_identity || 'another device'}`;
+  } else if (vlanCount > 1) {
+    classification = 'uplink';
+    reason = `MACs seen across ${vlanCount} VLANs — carrying tagged/trunk traffic`;
+  } else if (macCount > UPLINK_MAC_THRESHOLD) {
+    classification = 'uplink';
+    reason = `${macCount} MAC addresses reachable through this port`;
+  }
+
+  res.json({
+    classification,
+    reason,
+    mac_count: macCount,
+    vlan_count: vlanCount,
+    neighbor: neighbor || null,
+    // Physically-connected view hides everything on an uplink; ?all=true returns the raw FDB.
+    clients: all || classification === 'access' ? rows : [],
+  });
+});
+
+// GET /api/devices/:id/ports (switch port layout with VLAN info)
+router.get('/:id/ports', async (req: Request, res: Response) => {
+  const [ifaces, bridgePorts, vlans] = await Promise.all([
+    query(`SELECT * FROM interfaces WHERE device_id = $1 ORDER BY name`, [req.params.id]),
+    query(`SELECT * FROM bridge_vlan_entries WHERE device_id = $1`, [req.params.id]),
+    query(`SELECT * FROM vlans WHERE device_id = $1`, [req.params.id]),
+  ]);
+
+  // Enrich interface data with VLAN info
+  const bridgePortMap = new Map(bridgePorts.map((bp: Record<string, unknown>) => [bp['port'], bp]));
+
+  const ports = ifaces
+    .filter((i: Record<string, unknown>) =>
+      String(i['type'] || '').match(/^(ether|sfp|combo|bridge|bond)/i) ||
+      String(i['name'] || '').match(/^(ether|sfp|combo|bridge|bond|lag)/i)
+    )
+    .map((i: Record<string, unknown>) => ({
+      ...i,
+      bridgeInfo: bridgePortMap.get(i['name']) || null,
+    }));
+
+  return res.json({ ports, vlans });
+});
+
+// GET /api/devices/:id/routing
+router.get('/:id/routing', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<{ id: number; ip_address: string; api_port: number; api_username: string; api_password_encrypted: string }>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow as any);
+  try {
+    await collector.connect();
+    const routes = await collector.getRoutingTable();
+    return res.json(routes);
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// GET /api/devices/:id/firewall
+router.get('/:id/firewall', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    return res.json(await collector.getFirewallRules());
+  } finally {
+    collector.disconnect();
+  }
+});
+
+const FW_FIELD_MAP: Record<string, string> = {
+  chain: 'chain', action: 'action', protocol: 'protocol', comment: 'comment', disabled: 'disabled',
+  src_address: 'src-address', dst_address: 'dst-address',
+  src_port: 'src-port', dst_port: 'dst-port',
+  in_interface: 'in-interface', out_interface: 'out-interface',
+  connection_state: 'connection-state', jump_target: 'jump-target',
+  log: 'log', log_prefix: 'log-prefix',
+  src_address_list: 'src-address-list', dst_address_list: 'dst-address-list',
+};
+
+/**
+ * Map a firewall form body to RouterOS properties. When editing (keepEmpty),
+ * an empty value is kept, meaning "clear this" (DeviceCollector.setItem
+ * unsets it); dropping it left the old value on the device (P2-10).
+ */
+function bodyToRosParams(body: Record<string, unknown>, keepEmpty = false): Record<string, string> {
+  const params: Record<string, string> = {};
+  for (const [jsKey, rosKey] of Object.entries(FW_FIELD_MAP)) {
+    const val = body[jsKey];
+    if (val === undefined || val === null) continue;
+    if (val === '' && !keepEmpty) continue;
+    params[rosKey] = String(val);
+  }
+  return params;
+}
+
+// Firewall filter writes run under Change Guard with a simulated change, so the
+// lockout check sees the rule as it will be: a toggle that sends only
+// disabled=no, a move or a delete used to skip the check (outside review P2-8).
+// `force` is the older name for confirm_lockout and is still accepted.
+
+// POST /api/devices/:id/firewall
+router.post('/:id/firewall', requireWrite, async (req: Request, res: Response) => {
+  const { chain, action } = req.body;
+  if (!chain || !action) return res.status(400).json({ error: 'chain and action are required' });
+  const params = bodyToRosParams(req.body);
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'firewall.add', summary: `Add ${chain} ${action} firewall rule`,
+      change: { kind: 'firewall.add', fields: params } },
+    async (c) => { await c.addFirewallRule(params); return { message: 'Rule added' }; });
+});
+
+// PUT /api/devices/:id/firewall/:ruleId
+router.put('/:id/firewall/:ruleId', requireWrite, async (req: Request, res: Response) => {
+  const params = bodyToRosParams(req.body, true);
+  const ruleId = req.params.ruleId;
+  const summary = Object.keys(params).length === 1 && 'disabled' in params
+    ? `${params.disabled === 'yes' || params.disabled === 'true' ? 'Disable' : 'Enable'} firewall rule`
+    : 'Edit firewall rule';
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'firewall.set', summary, change: { kind: 'firewall.set', ruleId, fields: params } },
+    async (c) => { await c.updateFirewallRule(ruleId, params); return { message: 'Rule updated' }; });
+});
+
+// POST /api/devices/:id/firewall/move  { id, destination? }
+router.post('/:id/firewall/move', requireWrite, async (req: Request, res: Response) => {
+  const { id, destination } = req.body;
+  if (!id) return res.status(400).json({ error: 'id is required' });
+  const ruleId = String(id);
+  const dest = destination ? String(destination) : undefined;
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'firewall.move', summary: 'Move firewall rule', change: { kind: 'firewall.move', ruleId, destination: dest } },
+    async (c) => { await c.moveFirewallRule(ruleId, dest); return { message: 'Rule moved' }; });
+});
+
+// POST /api/devices/:id/firewall/reset-counters
+router.post('/:id/firewall/reset-counters', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    await collector.resetFirewallCounters();
+    return res.json(await collector.getFirewallRules());
+  } catch (err) {
+    return res.status(500).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// DELETE /api/devices/:id/firewall/:ruleId  (?confirm_lockout=true to override a warning)
+router.delete('/:id/firewall/:ruleId', requireWrite, async (req: Request, res: Response) => {
+  const ruleId = req.params.ruleId;
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'firewall.remove', summary: 'Delete firewall rule', change: { kind: 'firewall.remove', ruleId } },
+    async (c) => { await c.deleteFirewallRule(ruleId); return { message: 'Rule deleted' }; });
+});
+
+// ─── NAT Rules ────────────────────────────────────────────────────────────────
+const NAT_FIELD_MAP: Record<string, string> = {
+  chain: 'chain', action: 'action', protocol: 'protocol', comment: 'comment', disabled: 'disabled',
+  src_address: 'src-address', dst_address: 'dst-address',
+  src_port: 'src-port', dst_port: 'dst-port',
+  in_interface: 'in-interface', out_interface: 'out-interface',
+  to_addresses: 'to-addresses', to_ports: 'to-ports',
+  log: 'log', log_prefix: 'log-prefix',
+};
+
+function natBodyToRosParams(body: Record<string, unknown>, keepEmpty = false): Record<string, string> {
+  const params: Record<string, string> = {};
+  for (const [jsKey, rosKey] of Object.entries(NAT_FIELD_MAP)) {
+    const val = body[jsKey];
+    if (val !== undefined && val !== null && (val !== '' || keepEmpty)) {
+      params[rosKey] = String(val);
+    }
+  }
+  return params;
+}
+
+// GET /api/devices/:id/nat
+router.get('/:id/nat', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    return res.json(await collector.getNatRules());
+  } catch (err) {
+    return res.status(500).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// NAT writes run under Change Guard. There is no model of NAT, so nothing is
+// predicted, but a dst-nat or redirect that catches the manager's own traffic
+// is undone automatically instead of stranding the device (outside review P2-8).
+
+// POST /api/devices/:id/nat
+router.post('/:id/nat', requireWrite, async (req: Request, res: Response) => {
+  const { chain, action } = req.body;
+  if (!chain || !action) return res.status(400).json({ error: 'chain and action are required' });
+  const params = natBodyToRosParams(req.body);
+  await withGuardedChange(req.params.id, req, res, { kind: 'nat.add', summary: `Add ${chain} ${action} NAT rule` },
+    async (c) => { await c.addNatRule(params); return { message: 'NAT rule added' }; });
+});
+
+// PUT /api/devices/:id/nat/:ruleId
+router.put('/:id/nat/:ruleId', requireWrite, async (req: Request, res: Response) => {
+  const params = natBodyToRosParams(req.body, true);
+  await withGuardedChange(req.params.id, req, res, { kind: 'nat.set', summary: 'Edit NAT rule' },
+    async (c) => { await c.updateNatRule(req.params.ruleId, params); return { message: 'NAT rule updated' }; });
+});
+
+// DELETE /api/devices/:id/nat/:ruleId
+router.delete('/:id/nat/:ruleId', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(req.params.id, req, res, { kind: 'nat.remove', summary: 'Delete NAT rule' },
+    async (c) => { await c.deleteNatRule(req.params.ruleId); return { message: 'NAT rule deleted' }; });
+});
+
+// POST /api/devices/:id/nat/move  { id, destination? }
+router.post('/:id/nat/move', requireWrite, async (req: Request, res: Response) => {
+  const { id, destination } = req.body;
+  if (!id) return res.status(400).json({ error: 'id is required' });
+  await withGuardedChange(req.params.id, req, res, { kind: 'nat.move', summary: 'Move NAT rule' },
+    async (c) => { await c.moveNatRule(String(id), destination ? String(destination) : undefined); return { message: 'NAT rule moved' }; });
+});
+
+// ─── Firewall Address Lists ─────────────────────────────────────────────────────
+// Shared helper for the security-feature routes below (DRYs the device fetch +
+// connect/disconnect lifecycle the rest of this file uses inline).
+async function withCollector<T>(
+  id: string,
+  res: Response,
+  fn: (c: DeviceCollector) => Promise<T>
+): Promise<void> {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [id]);
+  if (!deviceRow) { res.status(404).json({ error: 'Device not found' }); return; }
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    const result = await fn(collector);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+}
+
+// GET /api/devices/:id/management-path — how the manager reaches this device, and
+// which objects are therefore load-bearing. Read-only; useful on its own and as the
+// explanation behind a lockout warning.
+router.get('/:id/management-path', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  try {
+    const snap = await captureSnapshot(deviceRow as unknown as GuardDevice);
+    const path = resolveManagementPath(snap, deviceRow as unknown as GuardDevice);
+    return res.json(path);
+  } catch (err) {
+    return res.status(502).json({ error: `Could not read device state: ${(err as Error).message}` });
+  }
+});
+
+// POST /api/devices/:id/preflight — analyse a change WITHOUT applying it, so the UI
+// can warn while the user is still editing. Body: { change: PlannedChange }.
+router.post('/:id/preflight', requireWrite, async (req: Request, res: Response) => {
+  const change = req.body?.change as PlannedChange | undefined;
+  if (!change || typeof change !== 'object' || !('kind' in change)) {
+    return res.status(400).json({ error: 'change (with a kind) is required' });
+  }
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  try {
+    const snap = await captureSnapshot(deviceRow as unknown as GuardDevice);
+    return res.json(analyzeChange(snap, deviceRow as unknown as GuardDevice, change));
+  } catch (err) {
+    return res.status(502).json({ error: `Could not read device state: ${(err as Error).message}` });
+  }
+});
+
+// POST /api/devices/:id/change-guard/probe — what safety mechanisms this device
+// actually supports. Non-destructive: both probes create and remove a harmless
+// scheduler, and neither leaves anything behind.
+router.post('/:id/change-guard/probe', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const device = deviceRow as unknown as GuardDevice;
+  try {
+    // Sequential, not parallel: both add a scheduler, and overlapping them would
+    // make each one's history diff ambiguous.
+    const scheduler = await probeCapability(device);
+    const undo = await probeUndoCapability(device);
+    return res.json({ scheduler, undo });
+  } catch (err) {
+    return res.status(502).json({ error: `Could not probe device: ${(err as Error).message}` });
+  }
+});
+
+// POST /api/devices/:id/change-guard/check — can this device arm auto-revert right
+// now? Shown in the lockout dialog before the user confirms, so it never promises
+// protection the device cannot give. Saves and removes a throwaway restore point
+// and scheduler, exactly as a real guard would.
+router.post('/:id/change-guard/check', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const r = await probeCapability(deviceRow as unknown as GuardDevice);
+  return res.json({ ready: r.ok, mode: r.mode, reason: r.reason ?? null });
+});
+
+// GET /api/devices/:id/config-health — the standing audit's latest findings, read
+// from cache so the page loads without touching the device.
+router.get('/:id/config-health', async (req: Request, res: Response) => {
+  const device = await queryOne<{ config_health_checked_at: string | null }>(
+    `SELECT config_health_checked_at FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+
+  const findings = await query<{ rule: string; objects: string[] }>(
+    `SELECT rule, severity, title, detail, remediation, doc_url, objects, first_seen, last_seen
+     FROM device_config_findings
+     WHERE device_id = $1
+     ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, rule`,
+    [req.params.id]
+  );
+  return res.json({ findings: findings.map(withFix), checked_at: device.config_health_checked_at });
+});
+
+/** A finding with its one-click fix (#239), or the reason it has none. */
+function withFix<T extends { rule: string; objects: string[] }>(f: T): T & { fix: ReturnType<typeof fixFor>; no_fix_reason: string | null } {
+  const fix = fixFor(f.rule, f.objects ?? []);
+  return { ...f, fix, no_fix_reason: fix ? null : noFixReason(f.rule) };
+}
+
+// POST /api/devices/:id/config-health/fix { rule, objects } — apply a finding's
+// one-click fix (#239). Only a finding recorded for this device, only one with
+// a fix, and always under Change Guard; the audit runs again afterwards so the
+// finding clears.
+router.post('/:id/config-health/fix', requireWrite, async (req: Request, res: Response) => {
+  const { rule, objects } = req.body as { rule?: string; objects?: unknown };
+  if (typeof rule !== 'string' || !Array.isArray(objects) || !objects.every((o) => typeof o === 'string')) {
+    return res.status(400).json({ error: 'rule and objects are required' });
+  }
+  const recorded = await queryOne(
+    `SELECT 1 FROM device_config_findings WHERE device_id = $1 AND rule = $2 AND objects = $3::text[]`,
+    [req.params.id, rule, objects]);
+  if (!recorded) return res.status(404).json({ error: 'That finding isn\u2019t current for this device. Run the check again.' });
+  const plan = fixFor(rule, objects as string[]);
+  if (!plan) return res.status(400).json({ error: noFixReason(rule) });
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const rescan = async () => { await runConfigHealth(deviceRow as unknown as GuardDevice).catch(() => {}); };
+
+  if (rule === 'stp-disabled' || rule === 'stp-legacy-mode') {
+    const bridge = (objects as string[])[0];
+    return withGuardedChange(req.params.id, req, res,
+      { kind: 'config-health.fix', summary: plan.summary,
+        // Spanning tree reconverges when it starts; if the management path runs
+        // through this bridge, the change must be able to undo itself.
+        change: { kind: 'path-object.change', name: bridge, what: 'Changing the bridge\u2019s spanning tree mode' } },
+      async (c) => { await c.setBridgeProtocolMode(bridge, 'rstp'); return { message: `${plan.summary}: done` }; },
+      rescan);
+  }
+
+  if (rule === 'vlan-iface-not-tagged-on-bridge') {
+    const [, bridge, vidRaw] = objects as string[];
+    const vid = Number(vidRaw);
+    // Read the entry as it stands, so the bridge is added to what's there.
+    let entry: Record<string, string> | undefined;
+    const reader = new DeviceCollector(deviceRow);
+    try {
+      await reader.connect();
+      const entries = (await reader.getBridgeVlanEntries(bridge)).filter((e) => e['dynamic'] !== 'true');
+      const matches = entries.filter((e) => expandVlanIds(e['vlan-ids']).includes(vid));
+      if (matches.some((e) => expandVlanIds(e['vlan-ids']).length > 1)) {
+        return res.status(409).json({ error: `VLAN ${vid} on ${bridge} is part of a multi-VLAN entry; add ${bridge} as tagged there on the device.` });
+      }
+      entry = matches[0];
+    } catch (err) {
+      return res.status(502).json({ error: `Could not read the bridge VLAN table: ${(err as Error).message}` });
+    } finally {
+      reader.disconnect();
+    }
+    const list = (v: string | undefined) => (v || '').split(',').map((x) => x.trim()).filter(Boolean);
+    const tagged = [...new Set([...list(entry?.['tagged']), bridge])];
+    const untagged = list(entry?.['untagged']).filter((p) => p !== bridge);
+    return withGuardedChange(req.params.id, req, res,
+      { kind: 'config-health.fix', summary: plan.summary,
+        change: entry
+          ? { kind: 'vlan.update', bridge, vlanId: vid, tagged, untagged }
+          : { kind: 'vlan.add', bridge, vlanId: vid, tagged, untagged } },
+      async (c) => {
+        if (entry) await c.updateBridgeVlan(bridge, vid, tagged, untagged);
+        else await c.addBridgeVlan(bridge, vid, tagged, untagged);
+        return { message: `${plan.summary}: done` };
+      },
+      async (c) => { await c.collectVlans().catch(() => {}); await rescan(); });
+  }
+
+  return res.status(400).json({ error: noFixReason(rule) });
+});
+
+// POST /api/devices/:id/config-health/scan — audit now instead of waiting for the
+// scheduled pass. Read-only on the device, but it opens a connection.
+router.post('/:id/config-health/scan', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  try {
+    const { findings, checkedAt } = await runConfigHealth(deviceRow as unknown as GuardDevice);
+    // Same shape as the cached GET, so the UI has one contract for both.
+    return res.json({
+      findings: findings.map((f) => withFix({
+        rule: f.rule, severity: f.severity, title: f.title, detail: f.detail,
+        remediation: f.remediation, doc_url: f.docUrl, objects: f.objects,
+        first_seen: null, last_seen: checkedAt.toISOString(),
+      })),
+      checked_at: checkedAt.toISOString(),
+    });
+  } catch (err) {
+    return res.status(502).json({ error: `Could not read device state: ${(err as Error).message}` });
+  }
+});
+
+router.get('/:id/address-lists', async (req, res) => {
+  await withCollector(req.params.id, res, (c) => c.getAddressLists());
+});
+
+// GET /api/devices/:id/l3hw — L3 hardware offloading on the switch chip
+// (#254), read live: whether it's supported and on, the VLANs routed, and the
+// firewall and NAT rules that would stop applying to routed traffic.
+router.get('/:id/l3hw', async (req, res) => {
+  await withCollector(req.params.id, res, async (c) => {
+    const run = c.commandRunner();
+    const none = () => [] as Record<string, string>[];
+    const [switches, ports, settings, vlans, addresses, filter, nat, bridges] = await Promise.all([
+      run.execute('/interface/ethernet/switch/print').catch(none),
+      run.execute('/interface/ethernet/switch/port/print').catch(none),
+      run.execute('/interface/ethernet/switch/l3hw-settings/print').catch(none),
+      run.execute('/interface/vlan/print').catch(none),
+      run.execute('/ip/address/print').catch(none),
+      run.execute('/ip/firewall/filter/print').catch(none),
+      run.execute('/ip/firewall/nat/print').catch(none),
+      run.execute('/interface/bridge/print').catch(none),
+    ]);
+    const chipOn = switches.some((s) => s['l3-hw-offloading'] === 'true');
+    const monitor = chipOn
+      ? (await run.execute('/interface/ethernet/switch/l3hw-settings/monitor', { once: '' }).catch(none))[0]
+      : undefined;
+    return l3hwView(switches, ports, settings[0], monitor, vlans, addresses, filter, nat, bridges);
+  });
+});
+
+// GET /api/devices/:id/switch-vlans — the switch chip's own VLAN table and
+// port VLAN settings (#278), read live. Only older chips (Atheros 8327,
+// QCA8337 and similar) have them; elsewhere the menu doesn't exist and
+// supported is false. Read-only.
+router.get('/:id/switch-vlans', async (req, res) => {
+  await withCollector(req.params.id, res, async (c) => {
+    const run = c.commandRunner();
+    const none = () => [] as Record<string, string>[];
+    const [switches, vlanTable, ports, bridges] = await Promise.all([
+      run.execute('/interface/ethernet/switch/print').catch(none),
+      // null, not [], when the menu doesn't exist on this chip.
+      run.execute('/interface/ethernet/switch/vlan/print').catch(() => null),
+      run.execute('/interface/ethernet/switch/port/print').catch(none),
+      run.execute('/interface/bridge/print').catch(none),
+    ]);
+    return switchVlanView(switches, vlanTable, ports, bridges);
+  });
+});
+
+// PUT /api/devices/:id/l3hw { enabled, acknowledge_firewall? } — turn L3
+// hardware offloading on or off (#254), under Change Guard: the switch chip
+// reprograms its tables, which can interrupt forwarding briefly. Turning it on
+// while forward-chain or NAT rules exist needs acknowledge_firewall, because
+// offloaded traffic no longer passes them.
+router.put('/:id/l3hw', requireWrite, async (req: Request, res: Response) => {
+  const enabled = req.body?.enabled;
+  if (typeof enabled !== 'boolean') return res.status(400).json({ error: 'enabled (boolean) is required' });
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  let switchId: string;
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    const run = collector.commandRunner();
+    const none = () => [] as Record<string, string>[];
+    const [switches, filter, nat] = await Promise.all([
+      run.execute('/interface/ethernet/switch/print').catch(none),
+      run.execute('/ip/firewall/filter/print').catch(none),
+      run.execute('/ip/firewall/nat/print').catch(none),
+    ]);
+    const view = l3hwView(switches, [], undefined, undefined, [], [], filter, nat);
+    if (!view.supported || !view.switch) return res.status(400).json({ error: 'This device has no switch chip that supports L3 hardware offloading' });
+    if (view.enabled === enabled) return res.json({ message: `L3 hardware offloading is already ${enabled ? 'on' : 'off'}`, already: true });
+    if (enabled && (view.forwardRules > 0 || view.natRules > 0) && req.body?.acknowledge_firewall !== true) {
+      return res.status(409).json({
+        needs_acknowledgement: true, forward_rules: view.forwardRules, nat_rules: view.natRules,
+        error: `${view.forwardRules} forward-chain firewall rule${view.forwardRules === 1 ? '' : 's'} and ${view.natRules} NAT rule${view.natRules === 1 ? '' : 's'} ` +
+          `would no longer apply to routed traffic once it's offloaded. Confirm you don't rely on them for traffic between these VLANs.`,
+      });
+    }
+    switchId = view.switch.id;
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'l3hw.toggle', summary: `${enabled ? 'Turn on' : 'Turn off'} L3 hardware offloading` },
+    async (c) => {
+      await c.commandRunner().execute('/interface/ethernet/switch/set', { '.id': switchId, 'l3-hw-offloading': enabled ? 'yes' : 'no' });
+      return { message: `L3 hardware offloading is ${enabled ? 'on' : 'off'}` };
+    });
+});
+
+// GET /api/devices/:id/address-lists/client?address=IP — one client's view
+// (#145): every list on this router, which the address is in (entries a
+// firewall rule added are marked dynamic and can't be changed), the lists
+// firewall rules reference (changing those runs through lockout prediction),
+// and whether the address is a static DHCP lease here (a dynamic one can move
+// to another device, and the list entry would follow the address).
+router.get('/:id/address-lists/client', async (req, res) => {
+  const address = String(req.query.address || '').trim();
+  if (!net.isIP(address)) return res.status(400).json({ error: 'address must be an IP address' });
+  await withCollector(req.params.id, res, async (c) => {
+    const run = c.commandRunner();
+    const none = () => [] as Record<string, string>[];
+    const [entries, filter, nat, mangle, raw, leases] = await Promise.all([
+      c.getAddressLists(),
+      run.execute('/ip/firewall/filter/print').catch(none),
+      run.execute('/ip/firewall/nat/print').catch(none),
+      run.execute('/ip/firewall/mangle/print').catch(none),
+      run.execute('/ip/firewall/raw/print').catch(none),
+      run.execute('/ip/dhcp-server/lease/print').catch(none),
+    ]);
+    return clientAddressListView(entries as Record<string, string>[], [...filter, ...nat, ...mangle, ...raw], leases, address);
+  });
+});
+
+// Address-list writes are guarded too: the manager may be accepted by a list,
+// and removing it from that list locks it out (P2-8).
+router.post('/:id/address-lists', requireWrite, async (req, res) => {
+  const { list, address } = req.body;
+  if (!list || !address) return res.status(400).json({ error: 'list and address are required' });
+  const params: Record<string, string> = { list: String(list), address: String(address) };
+  if (req.body.comment) params.comment = String(req.body.comment);
+  if (req.body.timeout) params.timeout = String(req.body.timeout);
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'address-list.add', summary: `Add ${params.address} to address list ${params.list}`,
+      change: { kind: 'address-list.add', fields: params } },
+    async (c) => { await c.addAddressListEntry(params); return { message: 'Entry added' }; });
+});
+
+router.put('/:id/address-lists/:entryId', requireWrite, async (req, res) => {
+  const params: Record<string, string> = {};
+  for (const k of ['list', 'address', 'comment'] as const) if (req.body[k] !== undefined) params[k] = String(req.body[k]);
+  if (req.body.disabled !== undefined) params.disabled = req.body.disabled ? 'yes' : 'no';
+  const entryId = req.params.entryId;
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'address-list.set', summary: 'Edit address list entry', change: { kind: 'address-list.set', entryId, fields: params } },
+    async (c) => { await c.updateAddressListEntry(entryId, params); return { message: 'Entry updated' }; });
+});
+
+router.delete('/:id/address-lists/:entryId', requireWrite, async (req, res) => {
+  const entryId = req.params.entryId;
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'address-list.remove', summary: 'Remove address list entry', change: { kind: 'address-list.remove', entryId } },
+    async (c) => { await c.removeAddressListEntry(entryId); return { message: 'Entry removed' }; });
+});
+
+// ─── Active Connections (read-only) ─────────────────────────────────────────────
+router.get('/:id/connections', async (req, res) => {
+  const limit = Math.min(parseInt(String(req.query.limit || '500'), 10) || 500, 2000);
+  await withCollector(req.params.id, res, async (c) => {
+    const [rows, tracking] = await Promise.all([c.getConnections(), c.getConnectionTracking()]);
+    // Connection tables can be huge; cap and surface the total so the UI can note truncation.
+    return { total: rows.length, connections: rows.slice(0, limit), tracking };
+  });
+});
+
+// ─── Simple Queues (bandwidth control) ──────────────────────────────────────────
+const QUEUE_FIELD_MAP: Record<string, string> = {
+  name: 'name', target: 'target', max_limit: 'max-limit', burst_limit: 'burst-limit',
+  burst_threshold: 'burst-threshold', burst_time: 'burst-time', priority: 'priority',
+  comment: 'comment', parent: 'parent',
+};
+function queueBodyToRos(body: Record<string, unknown>, keepEmpty = false): Record<string, string> {
+  const p: Record<string, string> = {};
+  for (const [js, ros] of Object.entries(QUEUE_FIELD_MAP)) {
+    const v = body[js];
+    if (v !== undefined && v !== null && (v !== '' || keepEmpty)) p[ros] = String(v);
+  }
+  if (body.disabled !== undefined) p.disabled = body.disabled ? 'yes' : 'no';
+  return p;
+}
+
+router.get('/:id/queues', async (req, res) => {
+  await withCollector(req.params.id, res, (c) => c.getSimpleQueues());
+});
+
+router.post('/:id/queues', requireWrite, async (req, res) => {
+  const { name, target, max_limit } = req.body;
+  if (!name || !target || !max_limit) return res.status(400).json({ error: 'name, target and max_limit are required' });
+  await withCollector(req.params.id, res, async (c) => { await c.addSimpleQueue(queueBodyToRos(req.body)); return c.getSimpleQueues(); });
+});
+
+router.put('/:id/queues/:queueId', requireWrite, async (req, res) => {
+  await withCollector(req.params.id, res, async (c) => { await c.updateSimpleQueue(req.params.queueId, queueBodyToRos(req.body, true)); return c.getSimpleQueues(); });
+});
+
+router.delete('/:id/queues/:queueId', requireWrite, async (req, res) => {
+  await withCollector(req.params.id, res, async (c) => { await c.removeSimpleQueue(req.params.queueId); return { message: 'Queue removed' }; });
+});
+
+// ─── IP Services + Security Posture audit ────────────────────────────────────────
+router.get('/:id/services', async (req, res) => {
+  await withCollector(req.params.id, res, (c) => c.getServices());
+});
+
+router.put('/:id/services/:serviceId', requireWrite, async (req, res) => {
+  if (req.body.allowed_from !== undefined) return setServiceAllowedFrom(req, res);
+  if (typeof req.body.disabled !== 'boolean') return res.status(400).json({ error: 'disabled (boolean) is required' });
+
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  // Disabling the very service ISPSense talks to is an immediate, certain
+  // self-lockout — and unlike other changes there is no legitimate way to do it
+  // from here, so it is refused outright rather than merely guarded.
+  if (req.body.disabled === true) {
+    const mgmtService = managementService(deviceRow);
+    const collector = new DeviceCollector(deviceRow);
+    try {
+      await collector.connect();
+      const services = await collector.getServices();
+      const target = (services as Record<string, string>[]).find((s) => s['.id'] === req.params.serviceId);
+      if (target && target['name'] === mgmtService) {
+        return res.status(409).json({
+          lockout: true,
+          reason: `'${mgmtService}' is the service ISPSense uses to reach this device. `
+            + `Disabling it would make the device unmanageable from here.`,
+        });
+      }
+    } catch { /* fall through to the guarded path */ } finally {
+      collector.disconnect();
+    }
+  }
+
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    { kind: 'service.toggle', summary: `${req.body.disabled ? 'Disable' : 'Enable'} IP service` },
+    async (c) => {
+      await c.setServiceDisabled(req.params.serviceId, req.body.disabled);
+      return { services: await c.getServices() };
+    }
+  );
+});
+
+/**
+ * Change which addresses a service accepts connections from (#192). On the
+ * service the manager connects through, a list that leaves out the manager's
+ * own address is refused: it would cut the manager off at once. Change Guard
+ * still undoes the change if the manager loses the device anyway.
+ */
+async function setServiceAllowedFrom(req: Request, res: Response) {
+  const parsed = parseAllowedList(req.body.allowed_from);
+  if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const mgmtService = managementService(deviceRow);
+
+  let key: 'available-from' | 'address';
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    const rows = await collector.getServicesWithConnections();
+    const target = configuredServices(rows).find((s) => s['.id'] === req.params.serviceId);
+    if (!target) return res.status(404).json({ error: 'Service not found on the device' });
+    key = allowedFromKey(target);
+    if (target['name'] === mgmtService && parsed.list.length > 0) {
+      const peer = managerPeer(rows, mgmtService, collector.apiLocalPort());
+      if (!peer) {
+        return res.status(409).json({
+          lockout: true,
+          reason: `'${mgmtService}' is the service ISPSense uses to reach this device, and the manager ` +
+            `couldn't tell which address the device sees it connecting from, so it can't check this list keeps it in.`,
+        });
+      }
+      if (!addressAllowed(peer, parsed.list)) {
+        return res.status(409).json({
+          lockout: true,
+          reason: `The device sees ISPSense connecting from ${peer}, which this list leaves out. ` +
+            `'${mgmtService}' is the service the manager uses, so saving it would cut the manager off. Add ${peer} or its subnet.`,
+        });
+      }
+    }
+  } catch (err) {
+    return res.status(502).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    { kind: 'service.allowed-from', summary: `Set allowed addresses on IP service to ${parsed.list.join(', ') || 'any'}` },
+    async (c) => {
+      await c.setServiceAllowedFrom(req.params.serviceId, key, parsed.list);
+      return { services: await c.getServices() };
+    }
+  );
+}
+
+// ─── Device identity (certificate and host key pinning, outside review P1-4) ──
+
+// GET /api/devices/identity/pending — devices whose certificate or host key
+// changed and wait for an admin, for the Security page.
+router.get('/identity/pending', async (req: Request, res: Response) => {
+  res.json(await pendingIdentityChanges(activeSite(req)));
+});
+
+// GET /api/devices/:id/identity — the pinned certificate and host key, and any change seen.
+router.get('/:id/identity', async (req: Request, res: Response) => {
+  res.json(await devicePins(parseInt(req.params.id, 10)));
+});
+
+// POST /api/devices/:id/identity/:kind/trust — accept the changed one. Admin
+// only: this is the decision that the device, not an impostor, changed.
+router.post('/:id/identity/:kind/trust', requireSiteAdmin, async (req: Request, res: Response) => {
+  const kind = IDENTITY_KINDS.find((k) => k === req.params.kind);
+  if (!kind) return res.status(400).json({ error: 'kind must be api-tls, ssh-host or serial' });
+  const trusted = await trustNewIdentity(parseInt(req.params.id, 10), kind);
+  if (!trusted) return res.status(404).json({ error: 'No changed certificate, host key or serial number is waiting for this device' });
+  const message = kind === 'serial' ? 'New device accepted. Polling resumes on the next cycle.'
+    : kind === 'api-tls' ? 'New certificate trusted.' : 'New host key trusted.';
+  return res.json({ message });
+});
+
+// POST /api/devices/:id/plain-api/off — turn off the plain API once the
+// manager is on API-SSL (#201). Refused unless the device is managed over
+// API-SSL and a login over it works right now, and skipped while anything else
+// is connected to the plain API (a script or monitoring tool would be cut off).
+// The change itself runs under Change Guard.
+router.post('/:id/plain-api/off', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const name = deviceRow.name.trim();
+  if (!usesApiTls(deviceRow)) {
+    return res.status(409).json({ error: `${name} is managed over the plain API. Switch it to API-SSL first; plain API can be turned off after that.` });
+  }
+  let serviceId: string | null = null;
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    // A fresh login over API-SSL: proof the manager won't need plain API.
+    await collector.connect();
+    const rows = await collector.getServicesWithConnections();
+    const api = configuredServices(rows).find((s) => s['name'] === 'api');
+    if (!api || api['disabled'] === 'true') return res.json({ already: true, message: `Plain API is already off on ${name}` });
+    const users = plainApiUsers(rows);
+    if (users.length > 0) {
+      return res.status(409).json({
+        error: `Plain API is in use on ${name} right now, from ${users.join(', ')}. Move ` +
+          `${users.length === 1 ? 'it' : 'them'} to API-SSL (8729), then turn plain API off.`,
+        in_use_by: users,
+      });
+    }
+    serviceId = api['.id'];
+  } catch (err) {
+    return res.status(502).json({ error: `Couldn’t log in to ${name} over API-SSL just now, so plain API stays on: ${safeConnectionError('api-ssl', err)}` });
+  } finally {
+    collector.disconnect();
+  }
+
+  await withGuardedChange(
+    req.params.id, req, res,
+    { kind: 'service.toggle', summary: 'Turn off plain API (api); the manager uses API-SSL' },
+    async (c) => {
+      await c.setServiceDisabled(serviceId!, true);
+      return { message: `Plain API is off on ${name}; the manager keeps using API-SSL` };
+    },
+  );
+});
+
+// POST /api/devices/:id/api-ssl — turn on API-SSL on the device and move the
+// manager's connection to it once a login over it works (outside review P1-4).
+router.post('/:id/api-ssl', requireWrite, async (req: Request, res: Response) => {
+  const device = await queryOne<ApiSslDevice>(
+    `SELECT id, name, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`, [req.params.id]);
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+  try {
+    const result = await enableApiSsl(device);
+    return res.json(result);
+  } catch (err) {
+    // Connection failures get the usual safe wording; anything the device
+    // itself said, or a step that explains itself, is shown as it is.
+    const msg = (err as Error).message ?? String(err);
+    const connectionProblem = !!(err as NodeJS.ErrnoException).code
+      || /timeout|connection|invalid user name or password/i.test(msg);
+    return res.status(502).json({
+      error: `Could not enable API-SSL: ${connectionProblem ? safeConnectionError('api-ssl', err) : msg}`,
+    });
+  }
+});
+
+// POST /api/devices/:id/www-ssl — WebFig over HTTPS (#234): certificate, www-ssl
+// on, and plain www off only once HTTPS answers.
+router.post('/:id/www-ssl', requireWrite, async (req: Request, res: Response) => {
+  try {
+    return res.json(await enableWwwSsl(parseInt(req.params.id, 10)));
+  } catch (err) {
+    const msg = (err as Error).message ?? String(err);
+    if (msg === 'Device not found') return res.status(404).json({ error: msg });
+    const connectionProblem = !!(err as NodeJS.ErrnoException).code
+      || /timeout|connection|invalid user name or password/i.test(msg);
+    return res.status(502).json({
+      error: `Could not switch WebFig to HTTPS: ${connectionProblem ? safeConnectionError('api', err) : msg}`,
+    });
+  }
+});
+
+// GET /api/devices/:id/security-posture — computes a hardening checklist.
+// Heuristic, not standards-based: graduated weighting that won't saturate to 0,
+// de-duplicated services, and it never proposes disabling the management
+// service ISPSense itself connects through (that would self-lockout).
+router.get('/:id/security-posture', async (req, res) => {
+  const device = await queryOne<DeviceRow & {
+    firmware_update_available?: boolean;
+    latest_ros_version?: string | null;
+    routerboard_upgrade_available?: boolean;
+    firmware_version?: string | null;
+    upgrade_firmware_version?: string | null;
+  }>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+  // Which RouterOS service the platform uses to reach this device. Default api
+  // (8728), or api-ssl where the device uses it (8729 or as set, #257). Never offered for disabling.
+  const mgmtService = managementService(device);
+  const isRouter = device.device_type === 'router';
+
+  await withCollector(req.params.id, res, async (c) => {
+    const [servicesRaw, fwRules, snmp] = await Promise.all([
+      c.getServices().catch(() => [] as Record<string, string>[]),
+      c.getFirewallRules().catch(() => [] as Record<string, string>[]),
+      c.getSnmpConfig().catch(() => ({} as Record<string, string>)),
+    ]);
+
+    // De-duplicate /ip/service rows by name (some devices report duplicates,
+    // e.g. api/route_BFD twice) so a service is only ever counted once.
+    const services = Array.from(new Map(servicesRaw.map(s => [s['name'] ?? s['.id'], s])).values());
+
+    type Sev = 'high' | 'medium' | 'low';
+    type Check = { id: string; severity: Sev; title: string; detail: string; serviceId?: string; fix?: 'api-ssl' | 'www-ssl' | 'api-off' };
+    const checks: Check[] = [];
+
+    for (const s of services) {
+      const name = s['name'] ?? '';
+      if (s['disabled'] === 'true') continue;
+
+      if (name === 'telnet' || name === 'ftp') {
+        checks.push({ id: `service-${name}`, severity: 'high', serviceId: s['.id'],
+          title: `Cleartext service "${name}" is enabled`,
+          detail: `${name} sends credentials and data unencrypted. Disable it; use SSH/SFTP instead.` });
+      } else if (name === 'www') {
+        checks.push({ id: 'service-www', severity: 'medium', serviceId: s['.id'], fix: 'www-ssl',
+          title: 'Unencrypted WebFig (www) is enabled',
+          detail: 'The HTTP WebFig interface is unencrypted. Switch to HTTPS: the manager enables "www-ssl" ' +
+            '(with a self-signed certificate if it has none) and turns "www" off only once HTTPS answers.' });
+      } else if (name === 'www-ssl' && (!s['certificate'] || s['certificate'] === 'none')) {
+        // Enabled without a certificate it can't complete a TLS handshake, so
+        // WebFig over HTTPS doesn't work at all (#234).
+        checks.push({ id: 'www-ssl-no-cert', severity: 'low', fix: 'www-ssl',
+          title: 'HTTPS WebFig (www-ssl) has no certificate',
+          detail: '"www-ssl" is enabled but has no certificate, so it can\u2019t answer HTTPS. Switching to HTTPS ' +
+            'assigns one (api-ssl\u2019s, or a new self-signed certificate).' });
+      } else if (name === 'api' && mgmtService !== 'api') {
+        // Plaintext API is on but the platform connects via api-ssl — safe to flag/disable.
+        checks.push({ id: 'service-api', severity: 'medium', serviceId: s['.id'], fix: 'api-off',
+          title: 'Unencrypted API (api) is enabled',
+          detail: 'The plaintext RouterOS API is exposed, and the manager already uses API-SSL. Turn plain API off: ' +
+            'the manager first checks it can log in over API-SSL and that nothing else is connected to plain API.' });
+      } else if (name === mgmtService && name === 'api') {
+        // The platform is connected through cleartext API — advise, but do NOT
+        // offer to disable it (that would cut ISPSense off the device).
+        checks.push({ id: 'mgmt-api-cleartext', severity: 'medium', fix: 'api-ssl',
+          title: 'ISPSense connects over the plain API',
+          detail: 'This device is managed over the unencrypted API (8728), which sends its login in the clear on every poll. ' +
+            'Switch to API-SSL: the manager enables it on the device (with a self-signed certificate if it has none) ' +
+            'and moves over only once it has logged in over it.' });
+      }
+    }
+
+    // Input-chain firewall: a real concern on routers; switches/APs commonly
+    // (and legitimately) rely on an upstream router's firewall, so it's only
+    // informational there rather than a high-severity hit.
+    const hasInputDrop = fwRules.some(r => (r['chain'] === 'input') && ['drop', 'reject'].includes(r['action'] ?? '') && r['disabled'] !== 'true');
+    if (!hasInputDrop) {
+      checks.push({
+        id: 'no-input-firewall', severity: isRouter ? 'high' : 'low',
+        title: 'No input-chain firewall rule',
+        detail: isRouter
+          ? 'This router has no enabled drop/reject rule on the input chain, leaving its own services exposed. Add a baseline input firewall.'
+          : 'No input-chain firewall on this device. Switches/APs often rely on an upstream router firewall — confirm that is the case.',
+      });
+    }
+
+    if (snmp && snmp['enabled'] === 'true') {
+      checks.push({ id: 'snmp-enabled', severity: 'low', title: 'SNMP is enabled',
+        detail: 'Ensure SNMP uses a non-default community string and is restricted to trusted addresses.' });
+    }
+
+    // Outdated firmware is a security exposure: RouterOS releases routinely
+    // ship security fixes, so a pending update counts against the posture.
+    // Titles stay version-free so the Security Center's "Common Findings"
+    // rollup aggregates devices on different versions into one row.
+    if (device.firmware_update_available && device.latest_ros_version) {
+      checks.push({
+        id: 'firmware-outdated', severity: 'medium',
+        title: 'RouterOS update available',
+        detail: `This device runs RouterOS ${device.ros_version || '(unknown)'} but ${device.latest_ros_version} is available. RouterOS releases regularly include security fixes — review the changelog and schedule the upgrade from the Firmware section.`,
+      });
+    }
+    if (device.routerboard_upgrade_available) {
+      checks.push({
+        id: 'routerboot-outdated', severity: 'low',
+        title: 'RouterBOOT upgrade pending',
+        detail: `The bootloader (${device.firmware_version || 'current'}) has an available upgrade${device.upgrade_firmware_version ? ` to ${device.upgrade_firmware_version}` : ''}. Apply it after the next RouterOS upgrade from the device's Config tab.`,
+      });
+    }
+
+    // Suppressions (issue #101). A finding the operator has judged inapplicable is
+    // marked rather than hidden: it stays visible, greyed, and stops counting
+    // against the score. Hiding it outright would make the posture unauditable.
+    const supp = await query<{ check_id: string; device_id: number | null; reason: string | null }>(
+      `SELECT check_id, device_id, reason FROM security_check_suppressions
+       WHERE device_id IS NULL OR device_id = $1`,
+      [device.id]
+    ).catch(() => []);
+    const suppressedBy = new Map<string, { scope: 'device' | 'fleet'; reason: string | null }>();
+    for (const row of supp) {
+      const scope = row.device_id == null ? 'fleet' : 'device';
+      // A device-specific row wins over a fleet-wide one, so the UI can offer the
+      // narrower undo.
+      if (scope === 'device' || !suppressedBy.has(row.check_id)) {
+        suppressedBy.set(row.check_id, { scope, reason: row.reason });
+      }
+    }
+
+    const marked = checks.map((c2) => {
+      const hit = suppressedBy.get(c2.id);
+      return hit ? { ...c2, suppressed: true, suppressed_scope: hit.scope, suppressed_reason: hit.reason } : c2;
+    });
+
+    // Graduated score: lighter weights + a floor of 5 so it never reads a hard
+    // 0 (which falsely implies "maximally insecure"). It's a relative hardening
+    // indicator, not an absolute grade.
+    const WEIGHT: Record<Sev, number> = { high: 15, medium: 7, low: 3 };
+    const counted = marked.filter((c2) => !('suppressed' in c2));
+    const penalty = counted.reduce((n, c2) => n + WEIGHT[c2.severity], 0);
+    const score = counted.length === 0 ? 100 : Math.max(5, 100 - penalty);
+    return { score, checks: marked };
+  });
+});
+
+// GET /api/devices/:id/resources (live resource usage)
+router.get('/:id/resources', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    const resource = await collector.getSystemResource();
+    return res.json(resource);
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// GET /api/devices/:id/system-config
+router.get('/:id/system-config', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    const config = await collector.getSystemConfig();
+    return res.json(config);
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// PUT /api/devices/:id/system-config
+router.put('/:id/system-config', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const { identity, ntp_enabled, ntp_primary, ntp_secondary, dns_servers, dns_allow_remote } = req.body;
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    // Each setting is applied only when it is in the request (the form sends
+    // only what changed). NTP and DNS used to be rewritten whenever the form was
+    // saved, and turning NTP on or off alone did nothing at all.
+    if (identity !== undefined) {
+      await collector.setSystemIdentity(identity);
+    }
+    if (ntp_enabled !== undefined || ntp_primary !== undefined || ntp_secondary !== undefined) {
+      await collector.setNtpConfig({
+        enabled: ntp_enabled === undefined ? undefined : ntp_enabled !== false,
+        primary: ntp_primary,
+        secondary: ntp_secondary,
+      });
+    }
+    if (dns_servers !== undefined || dns_allow_remote !== undefined) {
+      await collector.setDnsConfig({
+        servers: dns_servers,
+        allowRemote: dns_allow_remote === undefined ? undefined : dns_allow_remote === true,
+      });
+    }
+    return res.json({ message: 'System configuration updated' });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// GET /api/devices/:id/ip-addresses
+router.get('/:id/ip-addresses', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    const addresses = await collector.getIpAddresses();
+    // ?include=ipv6 adds the IPv6 addresses, for the Edit form's address
+    // picker (#178). Not by default: this list also backs the IPv4 address
+    // tab, whose add and remove act on /ip/address.
+    if (req.query.include === 'ipv6') {
+      const v6 = await collector.getIpv6Addresses();
+      return res.json([...addresses, ...v6.map((a) => ({ ...a, family: 'ipv6' }))]);
+    }
+    return res.json(addresses);
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// POST /api/devices/:id/ip-addresses
+router.post('/:id/ip-addresses', requireWrite, async (req: Request, res: Response) => {
+  const { address, interface: iface } = req.body;
+  if (!address || !iface) {
+    return res.status(400).json({ error: 'address and interface are required' });
+  }
+
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    { kind: 'ip.add', summary: `Add ${address} on ${iface}` },
+    async (c) => {
+      await c.addIpAddress(address, iface);
+      return { message: `Address ${address} added` };
+    },
+    async (c) => { await c.collectIpAddressesCache(); }
+  );
+});
+
+// DELETE /api/devices/:id/ip-addresses/:addrId
+// Guarded: removing the address the manager connects to is an immediate, total cut.
+router.delete('/:id/ip-addresses/:addrId', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    {
+      kind: 'ip.remove',
+      summary: `Remove IP address ${req.params.addrId}`,
+      change: { kind: 'ip.remove', addressId: req.params.addrId },
+    },
+    async (c) => {
+      await c.removeIpAddress(req.params.addrId);
+      return { message: 'IP address removed' };
+    },
+    async (c) => { await c.collectIpAddressesCache(); }
+  );
+});
+
+// POST /api/devices/:id/check-update
+router.post('/:id/check-update', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    const updateInfo = await collector.checkForUpdates();
+
+    // Persist results so the UI reflects the latest check immediately
+    const latestVersion = (updateInfo['latest-version'] ?? '').trim();
+    const installedVersion = (updateInfo['installed-version'] ?? '').trim();
+    const statusText = (updateInfo['status'] ?? '').toLowerCase();
+    // Compared as versions, not as strings: "different" is not "newer", and
+    // reading it that way offered an older release as an update (#144).
+    const hasUpdate = updateAvailable({
+      installed: installedVersion, latest: latestVersion, status: statusText,
+    });
+
+    await query(
+      `UPDATE devices SET firmware_update_available = $1, latest_ros_version = $2, updated_at = NOW() WHERE id = $3`,
+      [hasUpdate, latestVersion || null, deviceRow.id]
+    );
+
+    return res.json(updateInfo);
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// ─── Per-device SSH keys (#110) ──────────────────────────────────────────────
+
+
+/**
+ * GET /api/devices/:id/ssh-key — key status.
+ *
+ * The private half is never returned. Not here, not anywhere: it exists so that
+ * nobody has to hold a credential, and handing it back through the API would
+ * defeat the point while widening the surface at the same time.
+ */
+router.get('/:id/ssh-key', async (req: Request, res: Response) => {
+  try {
+    const row = await queryOne<Record<string, unknown>>(
+      `SELECT device_id, key_type, public_key, fingerprint, ssh_username, status,
+              last_error, last_verified_at, deployed_at, created_at
+         FROM device_ssh_keys WHERE device_id = $1`,
+      [req.params.id]
+    );
+    res.json({ key: row ?? null });
+  } catch (error) {
+    console.error('Error fetching SSH key:', error);
+    res.status(500).json({ error: 'Failed to fetch SSH key' });
+  }
+});
+
+// POST /api/devices/:id/ssh-key — generate, deploy and verify (rotates if one exists)
+router.post('/:id/ssh-key', requireWrite, async (req: Request, res: Response) => {
+  const target = await queryOne<any>(`SELECT ${SSH_TARGET_COLS} FROM devices WHERE id = $1`, [req.params.id]);
+  if (!target) return res.status(404).json({ error: 'Device not found' });
+
+  try {
+    const { sshKeyService } = await import('../services/SshKeyService');
+    const rotate = (req.body as { rotate?: boolean })?.rotate === true;
+    const key = await sshKeyService.deploy(target, { rotate });
+    res.json({
+      // Not "password access is unchanged" — that was wrong, and testing on
+      // hardware proved it. RouterOS refuses password SSH for a user once a key
+      // is bound to them, so this is a real trade the operator must know about.
+      message: rotate
+        ? 'New key deployed and verified; the previous one has been removed.'
+        : 'Key deployed and verified. Note that RouterOS now requires this key for SSH — '
+          + 'password SSH is disabled for this user until the key is revoked. '
+          + 'The API and WinBox are unaffected.',
+      key: { fingerprint: key.fingerprint, status: key.status, public_key: key.public_key },
+    });
+  } catch (error) {
+    // Deployment failures leave password auth untouched by design, and the
+    // message says so — otherwise the natural fear is that access was lost.
+    console.error('SSH key deployment failed:', (error as Error).message);
+    res.status(502).json({ error: (error as Error).message });
+  }
+});
+
+// POST /api/devices/:id/ssh-key/verify — re-prove an existing key
+router.post('/:id/ssh-key/verify', requireWrite, async (req: Request, res: Response) => {
+  const target = await queryOne<any>(`SELECT ${SSH_TARGET_COLS} FROM devices WHERE id = $1`, [req.params.id]);
+  if (!target) return res.status(404).json({ error: 'Device not found' });
+
+  const { sshKeyService } = await import('../services/SshKeyService');
+  const result = await sshKeyService.verify(target);
+  res.status(result.ok ? 200 : 502).json(
+    result.ok
+      ? { message: 'Key authenticated successfully.' }
+      : { error: `Key did not authenticate: ${result.error}` }
+  );
+});
+
+// DELETE /api/devices/:id/ssh-key — stop using the key, and remove it if reachable
+router.delete('/:id/ssh-key', requireWrite, async (req: Request, res: Response) => {
+  const target = await queryOne<any>(`SELECT ${SSH_TARGET_COLS} FROM devices WHERE id = $1`, [req.params.id]);
+  if (!target) return res.status(404).json({ error: 'Device not found' });
+
+  const { sshKeyService } = await import('../services/SshKeyService');
+  const result = await sshKeyService.revoke(target);
+  res.json({
+    message: result.removedFromDevice
+      ? 'Key revoked and removed from the device.'
+      : `Key forgotten here, but it could not be removed from the device (${result.error}). Remove it manually via /user/ssh-keys.`,
+    removed_from_device: result.removedFromDevice,
+  });
+});
+
+/**
+ * POST /api/devices/ssh-keys/deploy-all — retroactively key every device missing one.
+ *
+ * Sequential rather than parallel: each deployment opens two SSH sessions and
+ * ends by proving the key, and running sixty of those at once would be a
+ * thundering herd against the fleet for no wall-clock gain worth having.
+ */
+router.post('/ssh-keys/deploy-all', requireAdmin, async (req: Request, res: Response) => {
+  // This is the most consequential call in the feature: it disables password SSH
+  // across an entire fleet in one request. The per-device path asks for an
+  // acknowledgement in the UI, and an endpoint that can do it sixty times over
+  // should not be easier to trigger than the one that does it once.
+  if ((req.body as { confirm?: boolean })?.confirm !== true) {
+    return res.status(400).json({
+      error: 'Refusing to deploy fleet-wide without confirmation. This disables password ' +
+             'SSH for the configured user on every device it touches; the API and WinBox ' +
+             'are unaffected. Repeat with {"confirm": true} once that is understood.',
+    });
+  }
+
+  // Same eligibility as the fleet job (/api/ssh-keys/fleet), including the
+  // API-login fallback. Kept for API callers; it runs inside one request, so
+  // large fleets should use the job instead.
+  const candidates = await query<any>(
+    `SELECT ${SSH_TARGET_COLS}, d.status,
+            EXISTS (SELECT 1 FROM device_ssh_keys k WHERE k.device_id = d.id AND k.status = 'verified')
+              AS has_verified_key
+       FROM devices d
+      WHERE d.status != 'disabled'
+      ORDER BY d.name`
+  );
+  const targets = candidates.filter((t) => classifyKeyTarget(t).kind === 'eligible');
+
+  const { sshKeyService } = await import('../services/SshKeyService');
+  const results: { device_id: number; name: string; ok: boolean; error?: string }[] = [];
+  for (const t of targets) {
+    try {
+      await sshKeyService.deploy(t);
+      results.push({ device_id: t.id, name: t.name, ok: true });
+    } catch (e) {
+      results.push({ device_id: t.id, name: t.name, ok: false, error: (e as Error).message });
+    }
+  }
+  res.json({ considered: targets.length, succeeded: results.filter((r) => r.ok).length, results });
+});
+
+/**
+ * POST /api/devices/:id/install-update — install a pending RouterOS update.
+ *
+ * The check on the line below is load-bearing, not a courtesy. RouterOS installs
+ * the version discovered by `check-for-updates` **in the same API session**;
+ * issued on its own, `/system/package/update/install` replies `!done` and does
+ * nothing at all. This route used to do exactly that, so the button reported
+ * "Update installation initiated. Device will reboot." while the device sat
+ * untouched — verified against a switch that ignored this endpoint and then
+ * upgraded two minutes later through the rollout path, which does check first.
+ *
+ * The flag is likewise not cleared here. An upgrade takes minutes and a reboot,
+ * neither of which an HTTP request can wait for, so claiming the device is
+ * current the moment the command is sent puts a false "up to date" on every
+ * screen until the poller contradicts it. The poller owns that transition; this
+ * route reports only what it actually knows.
+ */
+router.post('/:id/install-update', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+
+    const status = await collector.checkForUpdates();
+    const installed = (status['installed-version'] || '').trim();
+    const latest = (status['latest-version'] || '').trim();
+
+    // Only a genuinely newer version: a channel offering an older release would
+    // otherwise install it, a downgrade (P2-9).
+    const decision = upgradeDecision(installed, latest);
+    if (decision.action === 'skip' && decision.reason !== 'Already up to date') {
+      return res.json({ started: false, installed_version: installed || null, message: decision.reason });
+    }
+    if (decision.action === 'skip') {
+      // Nothing to do is a real answer, not a failure — and it is the one state
+      // in which the device genuinely is current, so the flag can be trusted.
+      await query(
+        `UPDATE devices SET firmware_update_available = FALSE,
+                latest_ros_version = NULLIF($2,''), updated_at = NOW() WHERE id = $1`,
+        [deviceRow.id, latest]
+      );
+      return res.json({
+        started: false,
+        installed_version: installed || null,
+        message: `Already running ${installed || 'the latest version'} — nothing to install.`,
+      });
+    }
+
+    await collector.installUpdate();
+    await query(
+      `UPDATE devices SET latest_ros_version = NULLIF($2,''), updated_at = NOW() WHERE id = $1`,
+      [deviceRow.id, latest]
+    );
+    return res.json({
+      started: true,
+      installed_version: installed || null,
+      target_version: latest,
+      message: `Installing ${latest}. The device will reboot; the new version appears once it is back and polled.`,
+    });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// POST /api/devices/:id/check-routerboard
+router.post('/:id/check-routerboard', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    const info = await collector.checkRouterboardUpgrade();
+    await query(
+      `UPDATE devices SET routerboard_upgrade_available = $1, upgrade_firmware_version = $2, updated_at = NOW() WHERE id = $3`,
+      [info.upgradeAvailable, info.upgradeFirmware || null, deviceRow.id]
+    );
+    return res.json(info);
+  } finally {
+    collector.disconnect();
+  }
+});
+
+/**
+ * POST /api/devices/:id/install-routerboard — apply a pending RouterBOOT upgrade.
+ *
+ * Same shape as install-update above, and it had the same two faults: no check
+ * that anything was pending, and the flag cleared before the reboot it depends
+ * on had happened. `/system/routerboard/upgrade` on a current bootloader is a
+ * no-op, so the reboot that followed accomplished nothing while the UI reported
+ * an upgrade — and rebooting a device to achieve nothing is worse here than in
+ * the RouterOS case, because it costs an outage.
+ */
+router.post('/:id/install-routerboard', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+
+    const info = await collector.checkRouterboardUpgrade();
+    if (!info.upgradeAvailable) {
+      await query(
+        `UPDATE devices SET routerboard_upgrade_available = FALSE,
+                upgrade_firmware_version = NULLIF($2,''), updated_at = NOW() WHERE id = $1`,
+        [deviceRow.id, info.upgradeFirmware]
+      );
+      return res.json({
+        started: false,
+        current_firmware: info.currentFirmware || null,
+        message: `RouterBOOT is already at ${info.currentFirmware || 'the current version'} — nothing to upgrade.`,
+      });
+    }
+
+    await collector.installRouterboardUpgrade();
+    await query(
+      `UPDATE devices SET upgrade_firmware_version = NULLIF($2,''), updated_at = NOW() WHERE id = $1`,
+      [deviceRow.id, info.upgradeFirmware]
+    );
+    return res.json({
+      started: true,
+      current_firmware: info.currentFirmware || null,
+      target_firmware: info.upgradeFirmware,
+      message: `Upgrading RouterBOOT to ${info.upgradeFirmware}. The device will reboot.`,
+    });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// POST /api/devices/:id/reboot
+router.post('/:id/reboot', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    await collector.reboot();
+    return res.json({ message: 'Reboot command sent. Device will restart shortly.' });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// GET /api/devices/:id/clock
+router.get('/:id/clock', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    const clock = await collector.getClockConfig();
+    return res.json(clock);
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// PUT /api/devices/:id/clock
+router.put('/:id/clock', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    await collector.setClockConfig(req.body);
+    return res.json({ message: 'Clock updated' });
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// POST /api/devices/:id/routing (add static route)
+// Guarded: a new low-distance default route can re-point the path back to the manager.
+router.post('/:id/routing', requireWrite, async (req: Request, res: Response) => {
+  const { dst_address, gateway, distance, comment } = req.body;
+  if (!dst_address || !gateway) {
+    return res.status(400).json({ error: 'dst_address and gateway are required' });
+  }
+
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    { kind: 'route.add', summary: `Add route ${dst_address} via ${gateway}` },
+    async (c) => {
+      await c.addRoute(dst_address, gateway, distance, comment);
+      return { message: 'Route added' };
+    }
+  );
+});
+
+// DELETE /api/devices/:id/routing/:routeId
+// Guarded: removing the default route cuts off any manager that isn't on-subnet.
+router.delete('/:id/routing/:routeId', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    {
+      kind: 'route.remove',
+      summary: `Remove route ${req.params.routeId}`,
+      change: { kind: 'route.remove', routeId: req.params.routeId },
+    },
+    async (c) => {
+      await c.removeRoute(req.params.routeId);
+      return { message: 'Route removed' };
+    }
+  );
+});
+
+// ─── OSPF ─────────────────────────────────────────────────────────────────────
+router.get('/:id/routing/ospf', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    return res.json(await collector.getOspfData());
+  } finally { collector.disconnect(); }
+});
+
+// OSPF, BGP, routing tables and filters run under Change Guard. None of it is
+// simulated, but deleting the instance that carries the route back to the
+// manager is undone automatically instead of stranding the device (P2-8).
+router.post('/:id/routing/ospf/instance', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(req.params.id, req, res, { kind: 'routing.ospf.instance.post', summary: 'Add routing ospf instance' },
+    async (collector) => { await collector.addOspfInstance(req.body); return { success: true }; });
+});
+
+router.delete('/:id/routing/ospf/instance/:itemId', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(req.params.id, req, res, { kind: 'routing.ospf.instance.delete', summary: 'Remove routing ospf instance' },
+    async (collector) => { await collector.removeOspfInstance(decodeURIComponent(req.params.itemId)); return { success: true }; });
+});
+
+router.post('/:id/routing/ospf/area', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(req.params.id, req, res, { kind: 'routing.ospf.area.post', summary: 'Add routing ospf area' },
+    async (collector) => { await collector.addOspfArea(req.body); return { success: true }; });
+});
+
+router.delete('/:id/routing/ospf/area/:itemId', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(req.params.id, req, res, { kind: 'routing.ospf.area.delete', summary: 'Remove routing ospf area' },
+    async (collector) => { await collector.removeOspfArea(decodeURIComponent(req.params.itemId)); return { success: true }; });
+});
+
+// ─── BGP ──────────────────────────────────────────────────────────────────────
+router.get('/:id/routing/bgp', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    return res.json(await collector.getBgpData());
+  } finally { collector.disconnect(); }
+});
+
+router.post('/:id/routing/bgp/connection', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(req.params.id, req, res, { kind: 'routing.bgp.connection.post', summary: 'Add routing bgp connection' },
+    async (collector) => { await collector.addBgpConnection(req.body); return { success: true }; });
+});
+
+router.delete('/:id/routing/bgp/connection/:itemId', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(req.params.id, req, res, { kind: 'routing.bgp.connection.delete', summary: 'Remove routing bgp connection' },
+    async (collector) => { await collector.removeBgpConnection(decodeURIComponent(req.params.itemId)); return { success: true }; });
+});
+
+// ─── Routing Tables ───────────────────────────────────────────────────────────
+router.get('/:id/routing/tables', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    return res.json(await collector.getRoutingTablesData());
+  } finally { collector.disconnect(); }
+});
+
+router.post('/:id/routing/tables', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(req.params.id, req, res, { kind: 'routing.tables.post', summary: 'Add routing tables' },
+    async (collector) => { await collector.addRoutingTable(req.body); return { success: true }; });
+});
+
+router.delete('/:id/routing/tables/:itemId', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(req.params.id, req, res, { kind: 'routing.tables.delete', summary: 'Remove routing tables' },
+    async (collector) => { await collector.removeRoutingTable(decodeURIComponent(req.params.itemId)); return { success: true }; });
+});
+
+// ─── Route Filters ────────────────────────────────────────────────────────────
+router.get('/:id/routing/filters', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    return res.json(await collector.getRouteFiltersData());
+  } finally { collector.disconnect(); }
+});
+
+router.post('/:id/routing/filters/rule', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(req.params.id, req, res, { kind: 'routing.filters.rule.post', summary: 'Add routing filters rule' },
+    async (collector) => { await collector.addFilterRule(req.body); return { success: true }; });
+});
+
+router.put('/:id/routing/filters/rule/:itemId', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(req.params.id, req, res, { kind: 'routing.filters.rule.put', summary: 'Edit routing filters rule' },
+    async (collector) => { await collector.updateFilterRule(decodeURIComponent(req.params.itemId), req.body); return { success: true }; });
+});
+
+router.delete('/:id/routing/filters/rule/:itemId', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(req.params.id, req, res, { kind: 'routing.filters.rule.delete', summary: 'Remove routing filters rule' },
+    async (collector) => { await collector.removeFilterRule(decodeURIComponent(req.params.itemId)); return { success: true }; });
+});
+
+// ─── Router IDs ───────────────────────────────────────────────────────────────
+router.get('/:id/routing/router-id', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    return res.json(await collector.getRouterIds());
+  } finally { collector.disconnect(); }
+});
+
+// POST /api/devices/:id/vlans (add bridge VLAN)
+/**
+ * A single RouterOS bridge VLAN row can cover a range or list ("10-20"), which the
+ * cache expands into one row per VLAN. Editing or deleting one of those rows would
+ * rewrite the whole entry, silently taking the other VLANs with it — so refuse, and
+ * refuse *before* arming the guard, since a mid-apply failure would cost a reboot.
+ */
+function multiVlanRefusal(vlan: { vlan_id: number; bridge: string; vlan_ids: string | null }): string | null {
+  if (!isMultiVlanSpec(vlan.vlan_ids ?? undefined)) return null;
+  return `VLAN ${vlan.vlan_id} on ${vlan.bridge} is part of the multi-VLAN entry "${vlan.vlan_ids}". `
+    + `Changing it here would affect every VLAN in that entry, so split the entry on the device first.`;
+}
+
+// Guarded: bridge VLAN table edits decide which ports (and the bridge/CPU port
+// itself) may carry the management VLAN.
+router.post('/:id/vlans', requireWrite, async (req: Request, res: Response) => {
+  const { bridge, vlan_id, tagged_ports = [], untagged_ports = [] } = req.body;
+  // A whole number: 10.5 used to pass and become VLAN 10 on the device (U14).
+  if (!bridge || !Number.isInteger(vlan_id) || vlan_id < 1 || vlan_id > 4094) {
+    return res.status(400).json({ error: 'bridge and vlan_id (a whole number, 1-4094) are required' });
+  }
+
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    {
+      kind: 'vlan.add',
+      summary: `Add VLAN ${vlan_id} on ${bridge}`,
+      change: { kind: 'vlan.add', bridge, vlanId: vlan_id, tagged: tagged_ports, untagged: untagged_ports },
+    },
+    async (c) => {
+      await c.addBridgeVlan(bridge, vlan_id, tagged_ports, untagged_ports);
+      return { message: `VLAN ${vlan_id} added` };
+    },
+    async (c) => { await c.collectVlans(); }
+  );
+});
+
+// PUT /api/devices/:id/vlans/:vlanDbId (update tagged/untagged ports)
+router.put('/:id/vlans/:vlanDbId', requireWrite, async (req: Request, res: Response) => {
+  const vlan = await queryOne<{ id: number; vlan_id: number; bridge: string; vlan_ids: string | null }>(
+    `SELECT id, vlan_id, bridge, vlan_ids FROM vlans WHERE id = $1 AND device_id = $2`,
+    [req.params.vlanDbId, req.params.id]
+  );
+  if (!vlan) return res.status(404).json({ error: 'VLAN not found' });
+  const multi = multiVlanRefusal(vlan);
+  if (multi) return res.status(409).json({ error: multi, reason: multi });
+
+  const { tagged_ports = [], untagged_ports = [] } = req.body;
+
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    {
+      kind: 'vlan.update',
+      summary: `Update VLAN ${vlan.vlan_id} membership on ${vlan.bridge}`,
+      change: {
+        kind: 'vlan.update', bridge: vlan.bridge, vlanId: vlan.vlan_id,
+        tagged: tagged_ports, untagged: untagged_ports,
+      },
+    },
+    async (c) => {
+      await c.updateBridgeVlan(vlan.bridge, vlan.vlan_id, tagged_ports, untagged_ports);
+      return { message: `VLAN ${vlan.vlan_id} updated` };
+    },
+    async (c) => { await c.collectVlans(); }
+  );
+});
+
+// DELETE /api/devices/:id/vlans/:vlanDbId
+router.delete('/:id/vlans/:vlanDbId', requireWrite, async (req: Request, res: Response) => {
+  const vlan = await queryOne<{ vlan_id: number; bridge: string; vlan_ids: string | null }>(
+    `SELECT vlan_id, bridge, vlan_ids FROM vlans WHERE id = $1 AND device_id = $2`,
+    [req.params.vlanDbId, req.params.id]
+  );
+  if (!vlan) return res.status(404).json({ error: 'VLAN not found' });
+  const multi = multiVlanRefusal(vlan);
+  if (multi) return res.status(409).json({ error: multi, reason: multi });
+
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    {
+      kind: 'vlan.delete',
+      summary: `Remove VLAN ${vlan.vlan_id} from ${vlan.bridge}`,
+      change: { kind: 'vlan.delete', bridge: vlan.bridge, vlanId: vlan.vlan_id },
+    },
+    async (c) => {
+      await c.removeBridgeVlan(vlan.bridge, vlan.vlan_id);
+      return { message: 'VLAN removed' };
+    },
+    // Only drop the local row once the device is confirmed reachable — if the
+    // change auto-reverts, the VLAN still exists on the device.
+    async () => { await query(`DELETE FROM vlans WHERE id = $1`, [req.params.vlanDbId]); }
+  );
+});
+
+// POST /api/devices/:id/vlans/copy (bulk copy VLANs from another switch)
+//
+// Guarded, and simulated as the batch of VLAN writes it performs: copying can
+// overwrite the membership of the management VLAN, which the single-VLAN routes
+// already checked (outside review P2-8).
+router.post('/:id/vlans/copy', requireWrite, async (req: Request, res: Response) => {
+  const { operations } = req.body as {
+    operations: Array<{
+      action: 'add' | 'update';
+      vlan_id: number;
+      bridge: string;
+      tagged_ports: string[];
+      untagged_ports: string[];
+    }>;
+  };
+
+  if (!Array.isArray(operations) || operations.length === 0) {
+    return res.status(400).json({ error: 'operations array is required and must not be empty' });
+  }
+
+  const changes: PlannedChange[] = operations.map((op) => ({
+    kind: op.action === 'add' ? 'vlan.add' : 'vlan.update',
+    bridge: op.bridge,
+    vlanId: op.vlan_id,
+    tagged: op.tagged_ports,
+    untagged: op.untagged_ports,
+  }));
+
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'vlan.copy', summary: `Copy ${operations.length} VLAN(s)`, change: { kind: 'batch', changes } },
+    async (collector) => {
+      const results: Array<{ vlan_id: number; action: string; success: boolean; error?: string }> = [];
+      for (const op of operations) {
+        try {
+          if (op.action === 'add') {
+            await collector.addBridgeVlan(op.bridge, op.vlan_id, op.tagged_ports, op.untagged_ports);
+          } else {
+            await collector.updateBridgeVlan(op.bridge, op.vlan_id, op.tagged_ports, op.untagged_ports);
+          }
+          results.push({ vlan_id: op.vlan_id, action: op.action, success: true });
+        } catch (err) {
+          results.push({ vlan_id: op.vlan_id, action: op.action, success: false, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      return { results };
+    },
+    async (c) => { await c.collectVlans(); });
+});
+
+// ─── Bond (LAG / LACP) routes ────────────────────────────────────────────────
+
+// POST /api/devices/:id/bonds
+router.post('/:id/bonds', requireWrite, async (req: Request, res: Response) => {
+  const { name, mode, slaves, lacp_rate, transmit_hash_policy, mtu, min_links } = req.body;
+  if (!name || !mode || !Array.isArray(slaves) || slaves.length < 2) {
+    return res.status(400).json({ error: 'name, mode, and at least 2 slaves are required' });
+  }
+  // Guarded: creating a bond pulls its member ports out of their bridge first, so a
+  // failure part-way through can strand the uplink.
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    {
+      kind: 'bond.create',
+      summary: `Create bond '${name}' over ${slaves.join(', ')}`,
+      // Not simulated, but a member port the manager arrives on makes
+      // auto-revert mandatory rather than best-effort.
+      change: { kind: 'batch', changes: (slaves as string[]).map((sl) => ({ kind: 'path-object.change', name: sl, what: `Moving it into bond '${name}'` })) },
+    },
+    async (c) => {
+      await c.createBond(name, slaves, mode, {
+        lacpRate: lacp_rate, hashPolicy: transmit_hash_policy, mtu, minLinks: min_links,
+      });
+      return { message: 'Bond created' };
+    },
+    async (c) => { await c.collectInterfaces(); }
+  );
+});
+
+// PUT /api/devices/:id/bonds/:bondName
+// Guarded like create and delete: changing an uplink bond's members or mode can
+// take the device off the network (outside review P2-8).
+router.put('/:id/bonds/:bondName', requireWrite, async (req: Request, res: Response) => {
+  const { mode, slaves, lacp_rate, transmit_hash_policy, mtu, min_links } = req.body;
+  if (!mode || !Array.isArray(slaves) || slaves.length < 1) {
+    return res.status(400).json({ error: 'mode and slaves are required' });
+  }
+  const bond = req.params.bondName;
+  await withGuardedChange(req.params.id, req, res,
+    {
+      kind: 'bond.update',
+      summary: `Change bond '${bond}'`,
+      change: { kind: 'path-object.change', name: bond, what: 'Changing its members or settings' },
+    },
+    async (c) => {
+      await c.updateBond(bond, slaves, mode, {
+        lacpRate: lacp_rate, hashPolicy: transmit_hash_policy, mtu, minLinks: min_links,
+      });
+      return { message: 'Bond updated' };
+    },
+    async (c) => { await c.collectInterfaces(); });
+});
+
+// DELETE /api/devices/:id/bonds/:bondName
+// Guarded: removing a bond releases its member ports, which can take the device
+// off the network even when the bond looks unused.
+router.delete('/:id/bonds/:bondName', requireWrite, async (req: Request, res: Response) => {
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    {
+      kind: 'bond.delete',
+      summary: `Delete bond '${req.params.bondName}'`,
+      change: { kind: 'bond.delete', name: req.params.bondName },
+    },
+    async (c) => {
+      await c.deleteBond(req.params.bondName);
+      return { message: 'Bond deleted' };
+    },
+    async (c) => {
+      await query(`DELETE FROM interfaces WHERE device_id = $1 AND name = $2`, [req.params.id, req.params.bondName]);
+      await c.collectInterfaces();
+    }
+  );
+});
+
+// PUT /api/devices/:id/bridge/:bridgeName/vlan-filtering
+router.put('/:id/bridge/:bridgeName/vlan-filtering', requireWrite, async (req: Request, res: Response) => {
+  const { enabled } = req.body as { enabled: boolean };
+  // Guarded: turning on vlan-filtering with untagged management on the bridge is
+  // the single most common way to lock yourself out of a MikroTik.
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    {
+      kind: 'bridge.vlan-filtering',
+      summary: `${enabled ? 'Enable' : 'Disable'} VLAN filtering on bridge '${req.params.bridgeName}'`,
+      change: {
+        kind: 'bridge.vlan-filtering',
+        bridge: req.params.bridgeName,
+        enabled: Boolean(enabled),
+      },
+    },
+    async (c) => {
+      await c.setBridgeVlanFiltering(req.params.bridgeName, Boolean(enabled));
+      return { success: true, vlan_filtering: enabled };
+    },
+    async (c) => { await c.collectInterfaces(); }
+  );
+});
+
+// ─── Settings this device overrides (#261) ──────────────────────────────────
+// GET shows each setting's effective value and where it comes from (device,
+// site, global); PUT sets or (with null) clears the device's own overrides.
+
+router.get('/:id/poll-settings', async (req: Request, res: Response) => {
+  const s = await deviceSettings(Number(req.params.id));
+  if (!s) return res.status(404).json({ error: 'Device not found' });
+  return res.json({ overrides: s.device, site: { id: s.siteId, name: s.siteName, overrides: s.site }, effective: s.effective });
+});
+
+router.put('/:id/poll-settings', requireSiteAdmin, async (req: Request, res: Response) => {
+  const current = await deviceSettings(Number(req.params.id));
+  if (!current) return res.status(404).json({ error: 'Device not found' });
+  const v = validateOverrides(current.device, req.body);
+  if (!v.ok) return res.status(400).json({ error: v.error });
+  await query(`UPDATE devices SET poll_overrides = $2, updated_at = NOW() WHERE id = $1`,
+    [Number(req.params.id), Object.keys(v.value).length ? JSON.stringify(v.value) : null]);
+  const s = await deviceSettings(Number(req.params.id));
+  return res.json({ overrides: s!.device, site: { id: s!.siteId, name: s!.siteName, overrides: s!.site }, effective: s!.effective });
+});
+
+// ─── Bridge membership for any port (#258) ──────────────────────────────────
+
+/** Reads the device's bridge state for a pre-flight check; null when it answered with an error. */
+async function bridgeStateFor(id: string, res: Response, opts: { forDelete?: boolean } = {}) {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [id]);
+  if (!deviceRow) { res.status(404).json({ error: 'Device not found' }); return null; }
+  const c = new DeviceCollector(deviceRow);
+  try {
+    await c.connect();
+    return await c.readBridgeState(opts);
+  } catch (err) {
+    res.status(502).json({ error: `Couldn't read the device's bridges: ${(err as Error).message}` });
+    return null;
+  } finally {
+    c.disconnect();
+  }
+}
+
+/** An interface name as RouterOS allows it, without commas (list separators) or control characters. */
+const IFACE_NAME = { test: (v: string): boolean => v.length >= 1 && v.length <= 64 && ![...v].some((ch) => ch === ',' || ch.charCodeAt(0) < 32) };
+
+// POST /api/devices/:id/bridge-ports/move — put ports into a bridge (creating
+// it if asked), or take them out of any bridge. Guarded: moving the port the
+// manager arrives on out of its bridge cuts it off, and Change Guard predicts it.
+router.post('/:id/bridge-ports/move', requireWrite, async (req: Request, res: Response) => {
+  const { ports, bridge, create_bridge, confirm_addresses } = req.body ?? {};
+  if (!Array.isArray(ports) || ports.length === 0 || ports.length > 128
+    || !ports.every((p) => typeof p === 'string' && IFACE_NAME.test(p))) {
+    return res.status(400).json({ error: 'ports must be a list of interface names.' });
+  }
+  if (bridge !== null && (typeof bridge !== 'string' || !IFACE_NAME.test(bridge))) {
+    return res.status(400).json({ error: 'bridge must be a bridge name, or null for no bridge.' });
+  }
+  const create = create_bridge === true;
+
+  const t0 = Date.now();
+  const state = await bridgeStateFor(req.params.id, res);
+  if (!state) return;
+  console.log(`[bridge-move] device ${logSafe(req.params.id)}: read bridge state in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  const planned = planBridgePortMove({
+    ports, target: bridge, createTarget: create,
+    bridgePorts: state.bridgePorts, interfaces: state.interfaces, bridgeVlans: state.bridgeVlans,
+  });
+  if (!planned.ok) return res.status(400).json({ error: planned.error });
+  const moving = planned.plan.ops.map((o) => o.port);
+
+  if (bridge && confirm_addresses !== true) {
+    const found = addressesOnPorts(moving, state.addresses, state.dhcpClients);
+    if (found.length) {
+      return res.status(409).json({
+        code: 'ports_have_addresses',
+        error: `${found.join('; ')}. An address on a port stops working once the port is in a bridge.`,
+        details: found,
+      });
+    }
+  }
+
+  const list = moving.join(', ');
+  const summary = !bridge ? `Take ${list} out of their bridge`
+    : create ? `Create bridge '${bridge}' and move ${list} into it`
+      : `Move ${list} to bridge '${bridge}'`;
+  await withGuardedChange(
+    req.params.id, req, res,
+    { kind: 'bridge-port.move', summary, change: { kind: 'bridge-port.move', ports: moving, bridge: bridge ?? null } },
+    async (c) => {
+      const r = await c.moveBridgePorts(ports, bridge ?? null, { create, state });
+      return { message: summary, ...r };
+    },
+    async (c) => { await c.collectInterfaces(); await c.collectVlans().catch(() => {}); },
+  );
+});
+
+// DELETE /api/devices/:id/bridges/:bridgeName — only an empty, unused bridge.
+router.delete('/:id/bridges/:bridgeName', requireWrite, async (req: Request, res: Response) => {
+  const name = req.params.bridgeName;
+  if (!IFACE_NAME.test(name)) return res.status(400).json({ error: 'Invalid bridge name.' });
+  const state = await bridgeStateFor(req.params.id, res, { forDelete: true });
+  if (!state) return;
+  if (!state.interfaces.some((i) => i['name'] === name && i['type'] === 'bridge')) {
+    return res.status(404).json({ error: `There is no bridge called ${name} on this device.` });
+  }
+  const refusal = bridgeDeleteRefusal(name, state);
+  if (refusal) return res.status(409).json({ error: refusal });
+  await withGuardedChange(
+    req.params.id, req, res,
+    { kind: 'bridge.delete', summary: `Delete bridge '${name}'`, change: { kind: 'bridge.delete', bridge: name } },
+    async (c) => { await c.deleteBridge(name, { state }); return { message: `Bridge ${name} deleted` }; },
+    async (c) => { await c.collectInterfaces(); await c.collectVlans().catch(() => {}); },
+  );
+});
+
+// GET /api/devices/:id/hardware (live health: temps, voltages, fans, PSU)
+router.get('/:id/hardware', async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(
+    `SELECT id, ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    const health = await collector.getHardware();
+    return res.json(health);
+  } finally {
+    collector.disconnect();
+  }
+});
+
+// GET /api/devices/:id/wireless — cached wireless interfaces from postgres (for Radios tab)
+router.get('/:id/wireless', async (req: Request, res: Response) => {
+  const rows = await query(
+    `SELECT * FROM wireless_interfaces WHERE device_id = $1 ORDER BY name ASC`,
+    [req.params.id]
+  );
+  return res.json(rows);
+});
+
+// ─── LTE / cellular (discussion #85) ─────────────────────────────────────────
+
+// GET /api/devices/:id/lte — current state of every LTE interface
+router.get('/:id/lte', async (req: Request, res: Response) => {
+  try {
+    const interfaces = await query<Record<string, unknown>>(
+      `SELECT interface_name, status, data_class, modem_model, modem_revision, operator,
+              cell_id, enb_id, sector_id, phy_cell_id, session_uptime_s,
+              primary_band, ca_bands, rssi, rsrp, rsrq, sinr, cqi, rank_indicator, mcs,
+              dl_modulation, quality, allowed_bands, network_mode, apn_profiles,
+              allow_roaming, updated_at
+         FROM lte_interfaces WHERE device_id = $1 ORDER BY interface_name`,
+      [req.params.id],
+    );
+
+    // Bands seen serving this device. This is what a band lock gets checked
+    // against, since a scan interrupts service and finds nothing at a site with
+    // a single base station.
+    const observed = await query<{ interface_name: string; band: number; observations: number; last_seen: string }>(
+      `SELECT interface_name, band, observations, last_seen
+         FROM lte_observed_bands WHERE device_id = $1 ORDER BY band`,
+      [req.params.id],
+    );
+
+    res.json({
+      interfaces: interfaces.map(i => {
+        const carriers = {
+          primaryBand: (i.primary_band as LteBandInfo | null) ?? null,
+          caBands: (i.ca_bands as LteBandInfo[] | null) ?? [],
+        };
+        return {
+          ...i,
+          // Reconstruct the interpreted view so the client never re-derives it.
+          allowed_bands: parseBandList(i.allowed_bands as string | null),
+          total_bandwidth_mhz: totalBandwidthMhz(carriers),
+          // Uplink rides the primary carrier alone, so an anchor narrower than
+          // what is being aggregated caps upload however wide the downlink is.
+          uplink_anchor: uplinkAnchor(carriers),
+          observed_bands: observed
+            .filter(o => o.interface_name === i.interface_name)
+            .map(o => ({ band: o.band, observations: o.observations, last_seen: o.last_seen })),
+        };
+      }),
+    });
+  } catch (error) {
+    console.error('Error fetching LTE state:', error);
+    res.status(500).json({ error: 'Failed to fetch LTE state' });
+  }
+});
+
+// ─── Cellular data-cap SMS (discussion #85) ──────────────────────────────────
+
+// GET /api/devices/:id/lte/data-cap — rules and recent sends
+router.get('/:id/lte/data-cap', async (req: Request, res: Response) => {
+  try {
+    const rules = await query(
+      `SELECT id, interface_name, enabled, phone_number, message, threshold_bytes,
+              margin_pct, reset_hour, reset_minute, timezone, cooldown_minutes,
+              period_key, period_bytes, last_sent_at, updated_at
+         FROM lte_data_cap_rules WHERE device_id = $1 ORDER BY interface_name`,
+      [req.params.id]
+    );
+    const sends = await query(
+      `SELECT interface_name, at, trigger, phone_number, period_bytes, ok, error
+         FROM lte_data_cap_sends WHERE device_id = $1 ORDER BY at DESC LIMIT 20`,
+      [req.params.id]
+    );
+    res.json({ rules, sends });
+  } catch (error) {
+    console.error('Error fetching data-cap rules:', error);
+    res.status(500).json({ error: 'Failed to fetch data-cap rules' });
+  }
+});
+
+// PUT /api/devices/:id/lte/data-cap/:iface — create or update a rule
+router.put('/:id/lte/data-cap/:iface', requireWrite, async (req: Request, res: Response) => {
+  const b = req.body as Record<string, unknown>;
+  const phone = String(b.phone_number ?? '').trim();
+  if (!phone) return res.status(400).json({ error: 'phone_number is required' });
+
+  const threshold = Number(b.threshold_bytes);
+  if (!Number.isFinite(threshold) || threshold <= 0) {
+    return res.status(400).json({ error: 'threshold_bytes must be a positive number' });
+  }
+  // An unknown zone would silently park the counter in the wrong day, so reject
+  // it here rather than discovering it at midnight.
+  const tz = String(b.timezone ?? 'UTC');
+  try { new Intl.DateTimeFormat('en-CA', { timeZone: tz }); }
+  catch { return res.status(400).json({ error: `Unknown timezone "${tz}"` }); }
+
+  const clamp = (v: unknown, lo: number, hi: number, dflt: number) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.floor(n))) : dflt;
+  };
+
+  try {
+    await query(
+      `INSERT INTO lte_data_cap_rules
+         (device_id, interface_name, enabled, phone_number, message, threshold_bytes,
+          margin_pct, reset_hour, reset_minute, timezone, cooldown_minutes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (device_id, interface_name) DO UPDATE SET
+         enabled = EXCLUDED.enabled, phone_number = EXCLUDED.phone_number,
+         message = EXCLUDED.message, threshold_bytes = EXCLUDED.threshold_bytes,
+         margin_pct = EXCLUDED.margin_pct, reset_hour = EXCLUDED.reset_hour,
+         reset_minute = EXCLUDED.reset_minute, timezone = EXCLUDED.timezone,
+         cooldown_minutes = EXCLUDED.cooldown_minutes, updated_at = NOW()`,
+      [req.params.id, req.params.iface, b.enabled === true, phone,
+       String(b.message ?? ''), Math.floor(threshold),
+       clamp(b.margin_pct, 0, 50, 5), clamp(b.reset_hour, 0, 23, 0),
+       clamp(b.reset_minute, 0, 59, 0), tz, clamp(b.cooldown_minutes, 1, 1440, 60)]
+    );
+    res.json({ message: 'Data-cap rule saved' });
+  } catch (error) {
+    console.error('Error saving data-cap rule:', error);
+    res.status(500).json({ error: 'Failed to save rule' });
+  }
+});
+
+/**
+ * POST /api/devices/:id/lte/data-cap/:iface/send — send the SMS now.
+ *
+ * Deliberately independent of the rule being enabled, or of any threshold. This
+ * is the half of the feature that is trustworthy: the automatic trigger depends
+ * on a usage figure we reconstruct and therefore undercount, whereas pressing
+ * the button does exactly one thing for a reason the operator already knows.
+ */
+router.post('/:id/lte/data-cap/:iface/send', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const rule = await queryOne<{ phone_number: string; message: string; period_bytes: string }>(
+    `SELECT phone_number, message, period_bytes FROM lte_data_cap_rules
+      WHERE device_id = $1 AND interface_name = $2`,
+    [req.params.id, req.params.iface]
+  );
+  const phone = String((req.body as { phone_number?: string })?.phone_number || rule?.phone_number || '').trim();
+  if (!phone) return res.status(400).json({ error: 'No phone number configured for this interface' });
+
+  // Construction is inside the try on purpose: DeviceCollector decrypts the
+  // stored credential in its constructor, so a corrupted or missing one throws
+  // before a single line of the body runs. Left outside, that surfaced as a raw
+  // 500 with an internal message and no record of the attempt.
+  let collector: DeviceCollector | null = null;
+  try {
+    collector = new DeviceCollector(deviceRow);
+    await collector.connect();
+    await collector.sendSms(req.params.iface, phone, rule?.message ?? '');
+    await query(
+      `INSERT INTO lte_data_cap_sends (device_id, interface_name, trigger, phone_number, period_bytes, ok)
+       VALUES ($1,$2,'manual',$3,$4,TRUE)`,
+      [deviceRow.id, req.params.iface, phone, rule ? Number(rule.period_bytes) : null]
+    ).catch(() => {});
+    // The counter restarts with the carrier's, for the same reason the automatic
+    // path resets it: the message is what zeroes their allowance.
+    await query(
+      `UPDATE lte_data_cap_rules SET last_sent_at = NOW(), period_bytes = 0
+        WHERE device_id = $1 AND interface_name = $2`,
+      [deviceRow.id, req.params.iface]
+    ).catch(() => {});
+    res.json({ message: `SMS sent to ${phone}.` });
+  } catch (error) {
+    const raw = (error as Error).message;
+    // Credential problems are ours, not the modem's, and saying "could not send
+    // SMS: invalid encrypted text format" would send someone hunting the wrong
+    // fault entirely.
+    const msg = /encrypt|decrypt/i.test(raw)
+      ? 'stored credentials for this device could not be read'
+      : raw;
+    await query(
+      `INSERT INTO lte_data_cap_sends (device_id, interface_name, trigger, phone_number, ok, error)
+       VALUES ($1,$2,'manual',$3,FALSE,$4)`,
+      [deviceRow.id, req.params.iface, phone, msg]
+    ).catch(() => {});
+    console.error('Error sending data-cap SMS:', raw);
+    res.status(502).json({ error: `Could not send SMS: ${msg}` });
+  } finally {
+    collector?.disconnect();
+  }
+});
+
+// GET /api/devices/:id/lte/history — handovers, re-registrations and band changes
+router.get('/:id/lte/history', async (req: Request, res: Response) => {
+  const { range = '24h', limit = '200', iface } = req.query as { range?: string; limit?: string; iface?: string };
+  const windows: Record<string, string> = {
+    '1h': '1 hour', '24h': '24 hours', '7d': '7 days', '30d': '30 days',
+  };
+  const window = windows[range] || '24 hours';
+  const cap = Math.min(Math.max(parseInt(limit, 10) || 200, 1), 1000);
+
+  try {
+    const events = await query(
+      `SELECT interface_name, at, kind, detail, cell_id, enb_id, bands, rsrp, sinr
+         FROM lte_cell_history
+        WHERE device_id = $1 AND at > NOW() - $2::interval
+          AND ($4::text IS NULL OR interface_name = $4)
+        ORDER BY at DESC LIMIT $3`,
+      // One modem's history on a device with several (outside review U14).
+      [req.params.id, window, cap, iface ?? null],
+    );
+    res.json({ events });
+  } catch (error) {
+    console.error('Error fetching LTE history:', error);
+    res.status(500).json({ error: 'Failed to fetch LTE history' });
+  }
+});
+
+/**
+ * GET /api/devices/:id/lte/dwell — time spent on each band and each cell.
+ *
+ * The history panel lists every handover and grows without bound; this answers
+ * the question that list cannot, which is what the pattern actually is (#120).
+ */
+router.get('/:id/lte/dwell', async (req: Request, res: Response) => {
+  const { range = '7d', iface } = req.query as { range?: string; iface?: string };
+  const windows: Record<string, string> = {
+    '24h': '24 hours', '7d': '7 days', '30d': '30 days',
+  };
+  const window = windows[range] || '7 days';
+
+  try {
+    const rows = await query<{
+      interface_name: string; at: string; cell_id: string | null;
+      enb_id: string | null; bands: string | null;
+    }>(
+      `SELECT interface_name, at, cell_id, enb_id, bands
+         FROM lte_cell_history
+        WHERE device_id = $1 AND at > NOW() - $2::interval
+          AND ($3::text IS NULL OR interface_name = $3)
+        ORDER BY at ASC`,
+      [req.params.id, window, iface ?? null]
+    );
+
+    // The state in force when the window opened. Without it, a link that changed
+    // once yesterday would report a few minutes of dwell across seven days,
+    // having silently dropped everything before the first change in range.
+    // Per modem (outside review J7): one modem's last state, not whichever
+    // modem's change came last.
+    const priors = await query<{
+      interface_name: string; at: string; cell_id: string | null;
+      enb_id: string | null; bands: string | null;
+    }>(
+      `SELECT DISTINCT ON (interface_name) interface_name, at, cell_id, enb_id, bands
+         FROM lte_cell_history
+        WHERE device_id = $1 AND at <= NOW() - $2::interval
+          AND ($3::text IS NULL OR interface_name = $3)
+        ORDER BY interface_name, at DESC`,
+      [req.params.id, window, iface ?? null]
+    );
+
+    const [bounds] = await query<{ earliest: string | null }>(
+      `SELECT MIN(at) AS earliest FROM lte_cell_history WHERE device_id = $1`,
+      [req.params.id]
+    );
+
+    const now = new Date();
+    const windowStart = new Date(now.getTime() - intervalToMs(window));
+    const toEvent = (r: { at: string; cell_id: string | null; enb_id: string | null; bands: string | null }) =>
+      ({ at: new Date(r.at), cellId: r.cell_id, enbId: r.enb_id, bands: r.bands });
+
+    // Segments are built per modem: interleaving two modems' changes into one
+    // timeline cut each modem's stretches at the other's changes (J7).
+    const modems = new Set([...rows.map((r) => r.interface_name), ...priors.map((p) => p.interface_name)]);
+    const segments = [...modems].flatMap((m) => {
+      const prior = priors.find((p) => p.interface_name === m);
+      return buildSegments(rows.filter((r) => r.interface_name === m).map(toEvent), now, windowStart, prior ? toEvent(prior) : null);
+    });
+    const measuredSeconds = segments.reduce((n, s) => n + s.seconds, 0);
+
+    res.json({
+      range,
+      // Stated so the UI can be honest about a window longer than our records.
+      measured_seconds: measuredSeconds,
+      earliest_record: bounds?.earliest ?? null,
+      truncated: Boolean(bounds?.earliest && new Date(bounds.earliest) > windowStart),
+      changes: rows.length,
+      bands: summariseBands(segments, measuredSeconds),
+      cells: summarise(
+        segments,
+        (s) => s.cellId,
+        (key, s) => (s.enbId ? `Cell ${key} · eNB ${s.enbId}` : `Cell ${key}`)
+      ),
+    });
+  } catch (error) {
+    console.error('Error building LTE dwell stats:', error);
+    res.status(500).json({ error: 'Failed to build dwell statistics' });
+  }
+});
+
+// GET /api/devices/:id/lte/metrics — InfluxDB lte_signal time series
+router.get('/:id/lte/metrics', async (req: Request, res: Response) => {
+  const { iface, range = '6h' } = req.query as { iface?: string; range?: string };
+
+  const ranges: Record<string, string> = {
+    '1h': '1h', '6h': '6h', '24h': '24h', '7d': '7d', '30d': '30d',
+  };
+  const fluxRange = ranges[range] || '6h';
+  // Keep roughly 200 points regardless of window, so a month is as readable as an hour.
+  const windows: Record<string, string> = {
+    '1h': '30s', '6h': '2m', '24h': '10m', '7d': '1h', '30d': '4h',
+  };
+
+  const { getQueryApi } = await import('../config/influxdb');
+  const queryApi = getQueryApi();
+  const bucket = process.env.INFLUXDB_BUCKET || 'mikrotik';
+
+  const ifaceFilter = iface
+    ? `|> filter(fn: (r) => r["interface"] == ${fluxString(String(iface))})`
+    : '';
+
+  const flux = `
+    from(bucket: "${bucket}")
+      |> range(start: -${fluxRange})
+      |> filter(fn: (r) => r["_measurement"] == "lte_signal")
+      |> filter(fn: (r) => r["device_id"] == ${fluxString(String(req.params.id))})
+      ${ifaceFilter}
+      |> filter(fn: (r) => r["_field"] == "rsrp" or r["_field"] == "rsrq"
+                        or r["_field"] == "sinr" or r["_field"] == "rssi"
+                        or r["_field"] == "cqi"  or r["_field"] == "carriers")
+      |> aggregateWindow(every: ${windows[fluxRange] || '2m'}, fn: mean, createEmpty: false)
+      // Drop the tag columns before pivoting. Serving band is a tag, so leaving
+      // it in splits the result into one table per band — which streams back as
+      // a run of B1 rows followed by a run of B3 rows, and draws a chart that
+      // jumps backwards in time at the seam.
+      |> keep(columns: ["_time", "_field", "_value", "interface"])
+      |> group(columns: ["interface"])
+      |> pivot(rowKey:["_time","interface"], columnKey: ["_field"], valueColumn: "_value")
+      |> sort(columns: ["_time"])
+  `;
+
+  try {
+    const num = (v: unknown) => (v == null ? undefined : Math.round(Number(v) * 10) / 10);
+    const rows: Record<string, unknown>[] = [];
+    await new Promise<void>((resolve, reject) => {
+      queryApi.queryRows(flux, {
+        next(row, tableMeta) {
+          const obj = tableMeta.toObject(row) as Record<string, unknown>;
+          rows.push({
+            time: String(obj['_time'] || ''),
+            interface: String(obj['interface'] || ''),
+            rsrp: num(obj['rsrp']), rsrq: num(obj['rsrq']),
+            sinr: num(obj['sinr']), rssi: num(obj['rssi']),
+            cqi: num(obj['cqi']), carriers: num(obj['carriers']),
+          });
+        },
+        error: reject,
+        complete: resolve,
+      });
+    });
+    // One table per interface still streams sequentially, so order globally.
+    rows.sort((a, b) => String(a.time).localeCompare(String(b.time)));
+    res.json({ metrics: rows });
+  } catch (error) {
+    console.error('Error fetching LTE metrics:', error);
+    res.status(500).json({ error: 'Failed to fetch LTE metrics' });
+  }
+});
+
+// GET /api/devices/:id/wireless/metrics — InfluxDB wireless_stats time series
+router.get('/:id/wireless/metrics', async (req: Request, res: Response) => {
+  const { iface, range = '6h' } = req.query as { iface?: string; range?: string };
+
+  const ranges: Record<string, string> = {
+    '1h': '1h', '3h': '3h', '6h': '6h', '12h': '12h', '24h': '24h', '7d': '7d',
+  };
+  const fluxRange = ranges[range] || '6h';
+
+  const { getQueryApi } = await import('../config/influxdb');
+  const queryApi = getQueryApi();
+
+  const org = process.env.INFLUXDB_ORG || 'mikrotik';
+  const bucket = process.env.INFLUXDB_BUCKET || 'mikrotik';
+
+  const ifaceFilter = iface
+    ? `|> filter(fn: (r) => r["interface"] == ${fluxString(String(iface))})`
+    : '';
+
+  const flux = `
+    from(bucket: "${bucket}")
+      |> range(start: -${fluxRange})
+      |> filter(fn: (r) => r["_measurement"] == "wireless_stats")
+      |> filter(fn: (r) => r["device_id"] == ${fluxString(String(req.params.id))})
+      ${ifaceFilter}
+      |> filter(fn: (r) => r["_field"] == "registered_clients" or r["_field"] == "noise_floor")
+      |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
+      |> pivot(rowKey:["_time","interface","ssid"], columnKey: ["_field"], valueColumn: "_value")
+      |> sort(columns: ["_time"])
+  `;
+
+  try {
+    const rows: { time: string; interface: string; ssid?: string; registered_clients?: number; noise_floor?: number }[] = [];
+    await new Promise<void>((resolve, reject) => {
+      queryApi.queryRows(flux, {
+        next(row, tableMeta) {
+          const obj = tableMeta.toObject(row) as Record<string, unknown>;
+          rows.push({
+            time: String(obj['_time'] || obj['time'] || ''),
+            interface: String(obj['interface'] || ''),
+            ssid: obj['ssid'] ? String(obj['ssid']) : undefined,
+            registered_clients: obj['registered_clients'] != null ? Number(obj['registered_clients']) : undefined,
+            noise_floor: obj['noise_floor'] != null ? Number(obj['noise_floor']) : undefined,
+          });
+        },
+        error: reject,
+        complete: resolve,
+      });
+    });
+    return res.json(rows);
+  } catch (err) {
+    console.error('Wireless metrics InfluxDB error:', err);
+    return res.json([]);
+  }
+});
+
+// POST /api/devices/:id/test
+router.post('/:id/test', requireWrite, async (req: Request, res: Response) => {
+  const deviceRow = await queryOne<any>(
+    `SELECT ip_address, api_port, api_tls, api_username, api_password_encrypted FROM devices WHERE id = $1`,
+    [req.params.id]
+  );
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+
+  const client = new RouterOSClient(
+    deviceRow.ip_address, deviceRow.api_port,
+    deviceRow.api_username, decrypt(deviceRow.api_password_encrypted), 8000, 30000, usesApiTls(deviceRow),
+  );
+  try {
+    await client.connect();
+    const identity = await client.execute('/system/identity/print');
+    client.disconnect();
+    return res.json({ success: true, identity: identity[0]?.['name'] });
+  } catch (err) {
+    client.disconnect();
+    return res.status(422).json({ success: false, error: (err as Error).message });
+  }
+});
+
+// ─── Network Tools ─────────────────────────────────────────────────────────
+// Tools use a long read-timeout (120s) since ping/traceroute/ip-scan can take time.
+
+/** Devices with a packet capture in progress (C4). */
+const capturesRunning = new Set<number>();
+
+async function getToolDevice(id: string) {
+  return queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [id]);
+}
+
+function makeToolClient(device: DeviceRow): RouterOSClient {
+  return new RouterOSClient(
+    device.ip_address, device.api_port, device.api_username,
+    decrypt(device.api_password_encrypted),
+    15_000,   // connect timeout
+    120_000,  // read timeout — traceroute/ip-scan can take a while
+    usesApiTls(device),
+  );
+}
+
+// POST /api/devices/:id/tools/ping
+router.post('/:id/tools/ping', requireWrite, async (req: Request, res: Response) => {
+  const { address, count, interface: iface } = req.body as { address?: string; count?: number; interface?: string };
+  if (!address) return res.status(400).json({ error: 'address is required' });
+
+  const device = await getToolDevice(req.params.id);
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+
+  const client = makeToolClient(device);
+  try {
+    await client.connect();
+    const params: Record<string, string> = {
+      address,
+      count: String(Math.min(Math.max(1, Number(count) || 4), 20)),
+    };
+    if (iface) params['interface'] = iface;
+    const results = await client.execute('/tool/ping', params);
+    return res.json(results);
+  } catch (err) {
+    return res.status(500).json({ error: (err as Error).message });
+  } finally {
+    client.disconnect();
+  }
+});
+
+// POST /api/devices/:id/tools/traceroute
+router.post('/:id/tools/traceroute', requireWrite, async (req: Request, res: Response) => {
+  const { address } = req.body as { address?: string };
+  if (!address) return res.status(400).json({ error: 'address is required' });
+
+  const device = await getToolDevice(req.params.id);
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+
+  const client = makeToolClient(device);
+  try {
+    await client.connect();
+    const raw = await client.execute('/tool/traceroute', { address, count: '3', timeout: '1' });
+
+    // RouterOS sends multiple !re updates per hop as probes return.
+    // Deduplicate by .id, keeping the last (most complete) row per hop.
+    const byId = new Map<string, Record<string, string>>();
+    for (const row of raw) {
+      if (row['id']) byId.set(row['id'], row);
+    }
+    const results = Array.from(byId.values()).sort(
+      (a, b) => Number(a['id'] || 0) - Number(b['id'] || 0)
+    );
+    return res.json(results);
+  } catch (err) {
+    return res.status(500).json({ error: (err as Error).message });
+  } finally {
+    client.disconnect();
+  }
+});
+
+// POST /api/devices/:id/tools/ip-scan
+router.post('/:id/tools/ip-scan', requireWrite, async (req: Request, res: Response) => {
+  const { addressRange, interface: iface, rdns } = req.body as {
+    addressRange?: string;
+    interface?: string;
+    rdns?: boolean;
+  };
+  if (!addressRange) return res.status(400).json({ error: 'addressRange is required' });
+  if (!iface) return res.status(400).json({ error: 'interface is required' });
+
+  const device = await getToolDevice(req.params.id);
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+
+  const client = makeToolClient(device);
+  try {
+    await client.connect();
+    // /tool/ip-scan is a generator — it never sends !done on its own.
+    // Use executeStreaming to collect results for up to 30s then cancel.
+    const raw = await client.executeStreaming('/tool/ip-scan', {
+      'address-range': addressRange,
+      interface: iface,
+    }, 30_000);
+
+    // ip-scan re-emits the same host on every rescan cycle — deduplicate by address,
+    // keeping the last-seen entry (RouterOS updates fields like status over time).
+    const seen = new Map<string, Record<string, string>>();
+    for (const entry of raw) {
+      const key = entry['address'] ?? JSON.stringify(entry);
+      seen.set(key, entry);
+    }
+    const results = Array.from(seen.values());
+
+    if (!rdns) return res.json(results);
+
+    // Perform reverse DNS lookups concurrently on all discovered IPs.
+    const { reverse } = await import('dns/promises');
+    const enriched = await Promise.all(
+      results.map(async (r) => {
+        const ip = r['address'];
+        if (!ip) return { ...r, hostname: '' };
+        try {
+          const names = await reverse(ip);
+          return { ...r, hostname: names[0] ?? '' };
+        } catch {
+          return { ...r, hostname: '' };
+        }
+      })
+    );
+    return res.json(enriched);
+  } catch (err) {
+    return res.status(500).json({ error: (err as Error).message });
+  } finally {
+    client.disconnect();
+  }
+});
+
+// POST /api/devices/:id/tools/wol
+router.post('/:id/tools/wol', requireWrite, async (req: Request, res: Response) => {
+  const { mac, interface: iface } = req.body as { mac?: string; interface?: string };
+  if (!mac) return res.status(400).json({ error: 'mac is required' });
+  if (!iface) return res.status(400).json({ error: 'interface is required' });
+
+  // Basic MAC validation
+  if (!/^([0-9A-Fa-f]{2}[-:]){5}[0-9A-Fa-f]{2}$/.test(mac)) {
+    return res.status(400).json({ error: 'Invalid MAC address format' });
+  }
+
+  const device = await getToolDevice(req.params.id);
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+
+  const client = makeToolClient(device);
+  try {
+    await client.connect();
+    await client.execute('/tool/wol', { mac, interface: iface });
+    return res.json({ success: true, message: `WoL magic packet sent to ${mac} on ${iface}` });
+  } catch (err) {
+    return res.status(500).json({ error: (err as Error).message });
+  } finally {
+    client.disconnect();
+  }
+});
+
+// POST /api/devices/:id/tools/capture — packet capture via RouterOS sniffer + SFTP download
+router.post('/:id/tools/capture', requireWrite, async (req: Request, res: Response) => {
+  const { interface: iface, filter_ip, duration } = req.body as {
+    interface?: string; filter_ip?: string; duration?: number;
+  };
+  const captureSec = Math.min(Math.max(5, Number(duration) || 10), 60);
+
+  const device = await getToolDevice(req.params.id);
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+
+  // The file comes back over SFTP with the device's SSH key when it has one,
+  // otherwise its password (outside review C4). It used to need the password,
+  // which a keyed device no longer accepts.
+  let sshLogin: Awaited<ReturnType<typeof resolveAuth>>;
+  try {
+    sshLogin = await resolveAuth(device);
+  } catch {
+    return res.status(400).json({ error: 'SSH credentials required for packet capture. Add an SSH login or deploy an SSH key.' });
+  }
+
+  // One capture per device: the sniffer is a single shared tool on the device,
+  // so a second capture reconfigured and stopped the first (C4).
+  if (capturesRunning.has(device.id)) {
+    return res.status(409).json({ error: 'A packet capture is already running on this device. Try again when it finishes.' });
+  }
+  capturesRunning.add(device.id);
+
+  const fileName = `cap-${Date.now()}`;
+  const client = makeToolClient(device);
+
+  try {
+    console.log(`[capture] connecting to device ${device.id} (${device.ip_address})`);
+    await client.connect();
+    // Stop any in-progress capture before reconfiguring
+    await client.execute('/tool/sniffer/stop').catch(() => {});
+    const setParams: Record<string, string> = { 'file-name': fileName, 'file-limit': '10240' };
+    if (iface) setParams['filter-interface'] = iface;
+    if (filter_ip) setParams['filter-ip-address'] = filter_ip;
+    // Filters not given this time are cleared: the sniffer keeps its settings,
+    // so a capture meant to be unfiltered inherited the last one's (C4). The
+    // sniffer menu has no `unset`; an empty value is how it clears one.
+    for (const name of ['filter-interface', 'filter-ip-address'] as const) {
+      if (!setParams[name]) setParams[name] = '';
+    }
+    await client.execute('/tool/sniffer/set', setParams);
+    console.log(`[capture] starting ${captureSec}s capture`);
+    await client.execute('/tool/sniffer/start');
+    await new Promise((r) => setTimeout(r, captureSec * 1000));
+    await client.execute('/tool/sniffer/stop').catch(() => {});
+
+    // Poll /file/print until the capture file appears (up to 10s)
+    // RouterOS reports the exact SFTP-accessible path in the 'name' field
+    let remotePath: string | null = null;
+    for (let i = 0; i < 20 && !remotePath; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      const files = await client.execute('/file/print');
+      const hit = files.find((f) => (f['name'] ?? '').includes(fileName));
+      if (hit) remotePath = hit['name'];
+    }
+    client.disconnect();
+
+    if (!remotePath) {
+      throw new Error(`Sniffer did not create file "${fileName}.pcap" — check device storage`);
+    }
+    // RouterOS SFTP root is the device filesystem root; 'name' from /file/print is the path
+    const sftpPath = remotePath.startsWith('/') ? remotePath : `/${remotePath}`;
+    console.log(`[capture] file found: ${remotePath}; downloading via SFTP`);
+
+    // Download PCAP via SFTP then delete remote file
+    const pcapBuffer = await new Promise<Buffer>((resolve, reject) => {
+      const ssh = new SshClient();
+      ssh.on('ready', () => {
+        ssh.sftp((err, sftp) => {
+          if (err) { ssh.end(); return reject(new Error(`SFTP init failed: ${err.message}`)); }
+          const chunks: Buffer[] = [];
+          const stream = sftp.createReadStream(sftpPath);
+          stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+          stream.on('end', () => {
+            sftp.unlink(sftpPath, () => { ssh.end(); });
+            resolve(Buffer.concat(chunks));
+          });
+          stream.on('error', (e: Error) => {
+            // Try without leading slash in case RouterOS SFTP is rooted differently
+            if (sftpPath.startsWith('/') && e.message.includes('No such file')) {
+              const altPath = sftpPath.slice(1);
+              console.log(`[capture] retrying SFTP with path: ${altPath}`);
+              const chunks2: Buffer[] = [];
+              const stream2 = sftp.createReadStream(altPath);
+              stream2.on('data', (c: Buffer) => chunks2.push(c));
+              stream2.on('end', () => { sftp.unlink(altPath, () => { ssh.end(); }); resolve(Buffer.concat(chunks2)); });
+              stream2.on('error', (e2: Error) => { ssh.end(); reject(new Error(`SFTP read failed (tried ${sftpPath} and ${altPath}): ${e2.message}`)); });
+            } else {
+              ssh.end();
+              reject(new Error(`SFTP read failed (path=${sftpPath}): ${e.message}`));
+            }
+          });
+        });
+      });
+      ssh.on('error', (e) => reject(new Error(`SSH connect failed: ${explainSshError(e, device.ip_address, device.ssh_port ?? 22).message}`)));
+      ssh.connect({
+        host: device.ip_address,
+        port: device.ssh_port ?? 22,
+        username: sshLogin.username,
+        ...sshLogin.auth,
+        readyTimeout: 10_000,
+        ...sshHostCheck(device.ip_address, device.ssh_port ?? 22),
+      });
+    });
+
+    res.setHeader('Content-Type', 'application/vnd.tcpdump.pcap');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}.pcap"`);
+    return res.send(pcapBuffer);
+  } catch (err) {
+    client.disconnect();
+    console.error('[capture]', (err as Error).message);
+    return res.status(500).json({ error: (err as Error).message });
+  } finally {
+    capturesRunning.delete(device.id);
+  }
+});
+
+// POST /api/devices/:id/tools/btest — bandwidth test via RouterOS
+// If target_device_id is provided: automatically enable/disable btest server on the target device.
+// If only address is provided: manual mode — user must ensure the btest server is already running.
+router.post('/:id/tools/btest', requireWrite, async (req: Request, res: Response) => {
+  const { target_device_id, address, direction = 'both', duration = 5, protocol = 'tcp' } = req.body as {
+    target_device_id?: number; address?: string; direction?: string; duration?: number; protocol?: string;
+  };
+  if (!target_device_id && !address) {
+    return res.status(400).json({ error: 'target_device_id or address is required' });
+  }
+  const testSec = Math.min(Math.max(1, Number(duration) || 5), 30);
+
+  const device = await getToolDevice(req.params.id);
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+
+  // Resolve target: either a managed device (auto server management) or a manual IP
+  let targetAddress = address ?? '';
+  let targetUser: string | undefined;
+  let targetPassword: string | undefined;
+  let serverClient: RouterOSClient | null = null;
+
+  if (target_device_id) {
+    const target = await getToolDevice(String(target_device_id));
+    if (!target) return res.status(404).json({ error: 'Target device not found' });
+    targetAddress = target.ip_address;
+    targetUser = target.api_username;
+    targetPassword = decrypt(target.api_password_encrypted);
+    serverClient = new RouterOSClient(
+      target.ip_address, target.api_port, target.api_username, targetPassword, 15_000, 20_000, usesApiTls(target),
+    );
+  }
+
+  const client = new RouterOSClient(
+    device.ip_address, device.api_port, device.api_username,
+    decrypt(device.api_password_encrypted),
+    15_000,
+    (testSec + 15) * 1000,
+    usesApiTls(device),
+  );
+
+  let serverPrior: { enabled: string; authenticate: string } | null = null;
+  try {
+    // Enable bandwidth-test server on target device before running test. Its
+    // prior state is recorded first and put back afterwards (outside review
+    // C5): a server the operator had enabled used to be switched off.
+    if (serverClient) {
+      try {
+        await serverClient.connect();
+        const [prior] = await serverClient.execute('/tool/bandwidth-server/print');
+        serverPrior = {
+          enabled: prior?.['enabled'] === 'true' || prior?.['enabled'] === 'yes' ? 'yes' : 'no',
+          authenticate: prior?.['authenticate'] === 'false' || prior?.['authenticate'] === 'no' ? 'no' : 'yes',
+        };
+        await serverClient.execute('/tool/bandwidth-server/set', { enabled: 'yes', authenticate: 'yes' });
+      } finally {
+        serverClient.disconnect();
+      }
+    }
+
+    await client.connect();
+    const btestParams: Record<string, string> = {
+      address: targetAddress,
+      direction: ['receive', 'transmit', 'both'].includes(direction) ? direction : 'both',
+      duration: String(testSec),
+      protocol: ['tcp', 'udp'].includes(protocol) ? protocol : 'tcp',
+    };
+    // When testing against a managed device, authenticate with its RouterOS credentials
+    if (targetUser) btestParams['user'] = targetUser;
+    if (targetPassword) btestParams['password'] = targetPassword;
+
+    const rows = await client.executeStreaming('/tool/bandwidth-test', btestParams, (testSec + 15) * 1000);
+    client.disconnect();
+
+    const lastRow = rows.filter((r) => r['tx-total-average'] !== undefined || r['rx-total-average'] !== undefined).at(-1);
+    const toMbps = (v: string | undefined) => v ? Math.round(parseInt(v) / 1_000_000) : 0;
+
+    return res.json({
+      tx_mbps: toMbps(lastRow?.['tx-total-average']),
+      rx_mbps: toMbps(lastRow?.['rx-total-average']),
+      direction,
+      protocol,
+      duration: testSec,
+      target_ip: targetAddress,
+      raw: lastRow ?? rows.at(-1) ?? null,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: (err as Error).message });
+  } finally {
+    client.disconnect();
+    // Put the target's btest server back as it was (success or failure).
+    // Nothing to restore if its state was never read: nothing was changed.
+    if (serverClient && serverPrior) {
+      try {
+        await serverClient.connect();
+        await serverClient.execute('/tool/bandwidth-server/set', serverPrior);
+      } catch {
+        // Best-effort — don't mask the original error
+      } finally {
+        serverClient.disconnect();
+      }
+    }
+  }
+});
+
+export default router;
